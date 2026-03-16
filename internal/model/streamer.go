@@ -36,6 +36,10 @@ func NewStreamer(ctx context.Context, p *WhisperPipeline, params TranscribeParam
 		results:  make(chan Segment, 32),
 	}
 
+	if s.params.Logger != nil {
+		s.params.Logger.Info("streamer started")
+	}
+
 	go s.run()
 	return s
 }
@@ -48,6 +52,9 @@ func (s *WhisperStreamer) Push(samples []float32) error {
 	case s.audioIn <- samples:
 		return nil
 	default:
+		if s.params.Logger != nil {
+			s.params.Logger.Warn("streamer input buffer full, dropping samples")
+		}
 		return fmt.Errorf("streamer: input buffer full")
 	}
 }
@@ -59,6 +66,9 @@ func (s *WhisperStreamer) Results() <-chan Segment {
 
 // Close finalizes the stream and releases resources.
 func (s *WhisperStreamer) Close() error {
+	if s.params.Logger != nil {
+		s.params.Logger.Info("streamer closing")
+	}
 	s.cancel()
 	return nil
 }
@@ -98,9 +108,16 @@ func (s *WhisperStreamer) run() {
 			s.sampleCount += int64(consumeLen)
 			s.mu.Unlock()
 
+			if s.params.Logger != nil {
+				s.params.Logger.Debug("streamer processing chunk", "samples", len(chunk), "offset_ms", currentSampleCount*1000/int64(audio.SampleRate))
+			}
+
 			// Run transcription
 			res, err := s.pipeline.Transcribe(s.ctx, chunk, s.params)
 			if err != nil {
+				if s.params.Logger != nil {
+					s.params.Logger.Error("streamer transcription failed", "error", err)
+				}
 				s.mu.Lock()
 				s.err = err
 				s.mu.Unlock()
@@ -112,6 +129,11 @@ func (s *WhisperStreamer) run() {
 			for _, seg := range res.Segments {
 				seg.StartMs += offsetMs
 				seg.EndMs += offsetMs
+				
+				if s.params.Logger != nil {
+					s.params.Logger.Info("streamer result", "text", seg.Text, "start", seg.StartMs, "end", seg.EndMs)
+				}
+
 				select {
 				case <-s.ctx.Done():
 					return
