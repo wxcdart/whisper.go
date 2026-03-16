@@ -26,6 +26,16 @@ type Transcriber interface {
 	Transcribe(ctx context.Context, samples []float32, params TranscribeParams) (*Result, error)
 }
 
+// Streamer is a real-time transcription interface for incremental audio.
+type Streamer interface {
+	// Push adds new audio samples to the internal buffer.
+	Push(samples []float32) error
+	// Results returns a channel for receiving transcribed segments in real-time.
+	Results() <-chan Segment
+	// Close finalizes the stream and releases resources.
+	Close() error
+}
+
 // Segment is a transcribed time-stamped span of text.
 type Segment struct {
 	StartMs int64
