@@ -62,7 +62,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	outPath := filepath.Join(*outDir, fmt.Sprintf("ggml-%s.gguf", model))
+	outPath := filepath.Join(*outDir, fmt.Sprintf("ggml-%s.bin", model))
 
 	// Check if file already exists
 	if _, err := os.Stat(outPath); err == nil {
@@ -119,7 +119,7 @@ func downloadModel(model, outPath string) error {
 		baseURL = "https://huggingface.co/akashmjn/tinydiarize-whisper.cpp/resolve/main"
 	}
 
-	url := fmt.Sprintf("%s/ggml-%s.gguf", baseURL, model)
+	url := fmt.Sprintf("%s/ggml-%s.bin", baseURL, model)
 
 	fmt.Printf("Downloading %s from %s...\n", model, baseURL)
 
