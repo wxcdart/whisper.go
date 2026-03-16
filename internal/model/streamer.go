@@ -2,6 +2,7 @@ package model
 
 import (
 	"context"
+	"fmt"
 	"sync"
 
 	"github.com/whispergo/whisper.go/internal/audio"

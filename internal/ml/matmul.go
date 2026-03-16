@@ -42,25 +42,30 @@ func matmul2D(ctx context.Context, a, b Tensor, transB bool) (Tensor, error) {
 	M, K := a.Shape[0], a.Shape[1]
 	var N int
 	tB := blas.NoTrans
+	var bGeneral blas32.General
 	if transB {
-		// b is [N, K]
+		// b is [N, K], we want to treat it as [K, N] transposed.
+		// BLAS Gemm with blas.Trans expects the General struct to describe
+		// the NON-transposed matrix.
+		N = b.Shape[0]
 		if b.Shape[1] != K {
 			return Tensor{}, fmt.Errorf("%w: matmul2D transB: a K=%d != b cols=%d", ErrShapeMismatch, K, b.Shape[1])
 		}
-		N = b.Shape[0]
 		tB = blas.Trans
+		bGeneral = blas32.General{Rows: N, Cols: K, Data: b.Data, Stride: K}
 	} else {
 		// b is [K, N]
 		if b.Shape[0] != K {
 			return Tensor{}, fmt.Errorf("%w: matmul2D: a K=%d != b rows=%d", ErrShapeMismatch, K, b.Shape[0])
 		}
 		N = b.Shape[1]
+		bGeneral = blas32.General{Rows: K, Cols: N, Data: b.Data, Stride: N}
 	}
 	c := New(M, N)
 
 	blas32.Gemm(blas.NoTrans, tB, 1,
 		blas32.General{Rows: M, Cols: K, Data: a.Data, Stride: K},
-		blas32.General{Rows: K, Cols: N, Data: b.Data, Stride: N},
+		bGeneral,
 		0,
 		blas32.General{Rows: M, Cols: N, Data: c.Data, Stride: N},
 	)
@@ -97,12 +102,20 @@ func matmulBatched(ctx context.Context, a, b Tensor, transB bool) (Tensor, error
 			return Tensor{}, err
 		}
 		aOff := bIdx * M * K
-		bOff := bIdx * K * N
 		cOff := bIdx * M * N
+
+		var bGeneral blas32.General
+		if transB {
+			bOff := bIdx * N * K
+			bGeneral = blas32.General{Rows: N, Cols: K, Data: b.Data[bOff : bOff+N*K], Stride: K}
+		} else {
+			bOff := bIdx * K * N
+			bGeneral = blas32.General{Rows: K, Cols: N, Data: b.Data[bOff : bOff+K*N], Stride: N}
+		}
 
 		blas32.Gemm(blas.NoTrans, tB, 1,
 			blas32.General{Rows: M, Cols: K, Data: a.Data[aOff : aOff+M*K], Stride: K},
-			blas32.General{Rows: K, Cols: N, Data: b.Data[bOff : bOff+K*N], Stride: N},
+			bGeneral,
 			0,
 			blas32.General{Rows: M, Cols: N, Data: c.Data[cOff : cOff+M*N], Stride: N},
 		)
