@@ -3,14 +3,13 @@ package ml
 import (
 	"context"
 	"fmt"
-	"runtime"
 
-	"golang.org/x/sync/errgroup"
+	"gonum.org/v1/gonum/blas"
+	"gonum.org/v1/gonum/blas/blas32"
 )
 
 // MatMul computes C = A @ B.
 // Supports 2-D [M,K] x [K,N] → [M,N] and batched [B,M,K] x [B,K,N] → [B,M,N].
-// Parallelised over rows using errgroup.
 func MatMul(ctx context.Context, a, b Tensor) (Tensor, error) {
 	switch {
 	case len(a.Shape) == 2 && len(b.Shape) == 2:
@@ -37,14 +36,19 @@ func MatMulTransB(ctx context.Context, a, b Tensor) (Tensor, error) {
 
 // matmul2D handles the 2-D case, optionally treating B as transposed.
 func matmul2D(ctx context.Context, a, b Tensor, transB bool) (Tensor, error) {
+	if err := ctx.Err(); err != nil {
+		return Tensor{}, err
+	}
 	M, K := a.Shape[0], a.Shape[1]
 	var N int
+	tB := blas.NoTrans
 	if transB {
 		// b is [N, K]
 		if b.Shape[1] != K {
 			return Tensor{}, fmt.Errorf("%w: matmul2D transB: a K=%d != b cols=%d", ErrShapeMismatch, K, b.Shape[1])
 		}
 		N = b.Shape[0]
+		tB = blas.Trans
 	} else {
 		// b is [K, N]
 		if b.Shape[0] != K {
@@ -53,39 +57,14 @@ func matmul2D(ctx context.Context, a, b Tensor, transB bool) (Tensor, error) {
 		N = b.Shape[1]
 	}
 	c := New(M, N)
-	numCPU := runtime.NumCPU()
-	g, gctx := errgroup.WithContext(ctx)
-	chunkSize := (M + numCPU - 1) / numCPU
-	for start := 0; start < M; start += chunkSize {
-		start, end := start, start+chunkSize
-		if end > M {
-			end = M
-		}
-		g.Go(func() error {
-			for i := start; i < end; i++ {
-				if err := gctx.Err(); err != nil {
-					return err
-				}
-				for j := 0; j < N; j++ {
-					var sum float32
-					if transB {
-						for k := 0; k < K; k++ {
-							sum += a.Data[i*K+k] * b.Data[j*K+k]
-						}
-					} else {
-						for k := 0; k < K; k++ {
-							sum += a.Data[i*K+k] * b.Data[k*N+j]
-						}
-					}
-					c.Data[i*N+j] = sum
-				}
-			}
-			return nil
-		})
-	}
-	if err := g.Wait(); err != nil {
-		return Tensor{}, fmt.Errorf("ml: matmul: %w", err)
-	}
+
+	blas32.Gemm(blas.NoTrans, tB, 1,
+		blas32.General{Rows: M, Cols: K, Data: a.Data, Stride: K},
+		blas32.General{Rows: K, Cols: N, Data: b.Data, Stride: N},
+		0,
+		blas32.General{Rows: M, Cols: N, Data: c.Data, Stride: N},
+	)
+
 	return c, nil
 }
 
@@ -96,12 +75,14 @@ func matmulBatched(ctx context.Context, a, b Tensor, transB bool) (Tensor, error
 	}
 	B, M, K := a.Shape[0], a.Shape[1], a.Shape[2]
 	var N int
+	tB := blas.NoTrans
 	if transB {
 		// b is [B, N, K]
 		if b.Shape[2] != K {
 			return Tensor{}, fmt.Errorf("%w: matmulBatched transB: K mismatch", ErrShapeMismatch)
 		}
 		N = b.Shape[1]
+		tB = blas.Trans
 	} else {
 		// b is [B, K, N]
 		if b.Shape[1] != K {
@@ -110,45 +91,23 @@ func matmulBatched(ctx context.Context, a, b Tensor, transB bool) (Tensor, error
 		N = b.Shape[2]
 	}
 	c := New(B, M, N)
-	numCPU := runtime.NumCPU()
-	totalRows := B * M
-	g, gctx := errgroup.WithContext(ctx)
-	chunkSize := (totalRows + numCPU - 1) / numCPU
-	for start := 0; start < totalRows; start += chunkSize {
-		start, end := start, start+chunkSize
-		if end > totalRows {
-			end = totalRows
+
+	for bIdx := 0; bIdx < B; bIdx++ {
+		if err := ctx.Err(); err != nil {
+			return Tensor{}, err
 		}
-		g.Go(func() error {
-			for row := start; row < end; row++ {
-				if err := gctx.Err(); err != nil {
-					return err
-				}
-				batch := row / M
-				i := row % M
-				aOff := batch*M*K + i*K
-				cOff := batch*M*N + i*N
-				for j := 0; j < N; j++ {
-					var sum float32
-					if transB {
-						bOff := batch*N*K + j*K
-						for k := 0; k < K; k++ {
-							sum += a.Data[aOff+k] * b.Data[bOff+k]
-						}
-					} else {
-						bOff := batch * K * N
-						for k := 0; k < K; k++ {
-							sum += a.Data[aOff+k] * b.Data[bOff+k*N+j]
-						}
-					}
-					c.Data[cOff+j] = sum
-				}
-			}
-			return nil
-		})
+		aOff := bIdx * M * K
+		bOff := bIdx * K * N
+		cOff := bIdx * M * N
+
+		blas32.Gemm(blas.NoTrans, tB, 1,
+			blas32.General{Rows: M, Cols: K, Data: a.Data[aOff : aOff+M*K], Stride: K},
+			blas32.General{Rows: K, Cols: N, Data: b.Data[bOff : bOff+K*N], Stride: N},
+			0,
+			blas32.General{Rows: M, Cols: N, Data: c.Data[cOff : cOff+M*N], Stride: N},
+		)
 	}
-	if err := g.Wait(); err != nil {
-		return Tensor{}, fmt.Errorf("ml: matmul_batched: %w", err)
-	}
+
 	return c, nil
 }
+

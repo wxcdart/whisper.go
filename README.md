@@ -150,20 +150,16 @@ See `TEST.md` for integration testing details.
 - **SOLID Design** — Interfaces for extensibility (Encoder, Decoder, Formatter, VAD, Aligner)
 - **Context-aware** — All long-running operations respect `context.Context` for cancellation
 - **Pure Go** — No CGo, no C dependencies, single self-contained binary
-- **Minimal Dependencies** — Only `golang.org/x/sync` for `errgroup`
+- **Minimal Dependencies** — Only `golang.org/x/sync` and `gonum.org/v1/gonum`
 
 ## Performance
 
-Baseline (no optimization):
-- **Throughput** — Depends on model size and audio duration
-- **Memory** — ~500 MB for tiny model, scales with model size
-- **Parallelism** — Configurable thread count via CLI flag `-t`
+`whisper.go` uses **SIMD-accelerated** matrix multiplication via [Gonum BLAS](https://github.com/gonum/gonum).
 
-Future optimizations:
-- SIMD kernels (optional)
-- Tensor caching
-- Model quantisation (already supported)
-- Streaming decoding
+- **SIMD Kernels** — Assembly-optimized `Gemm` (AMD64, ARM64) via `gonum.org/v1/gonum/blas/blas32`.
+- **Throughput** — Significantly improved over pure Go loops for large matrix operations.
+- **Memory** — ~500 MB for tiny model, scales with model size.
+- **Parallelism** — Configurable thread count via CLI flag `-t`.
 
 ## Limitations & Future Work
 
@@ -182,7 +178,7 @@ Future optimizations:
 | **Test LOC** | ~1,200 |
 | **Total commits** | 40 |
 | **Go version** | 1.25.0 |
-| **Dependencies** | 1 (`golang.org/x/sync`) |
+| **Dependencies** | 2 (`golang.org/x/sync`, `gonum.org/v1/gonum`) |
 
 ## References
 
