@@ -533,17 +533,39 @@ func (d *WhisperDecoder) runDecoderSelfAttn(ctx context.Context, x ml.Tensor, at
 	// Update KV cache with new K and V.
 	// kvCache shape: [nLayer, 2, nTextCtx, nTextState]
 	// Store k and v at position pos.
+	nTextCtx := d.nTextCtx
+	nTextState := d.nTextState
+	kCacheOff := layerIdx*2*nTextCtx*nTextState + 0*nTextCtx*nTextState + pos*nTextState
+	vCacheOff := layerIdx*2*nTextCtx*nTextState + 1*nTextCtx*nTextState + pos*nTextState
+	copy(kvCache.Data[kCacheOff:kCacheOff+nTextState], k.Data)
+	copy(kvCache.Data[vCacheOff:vCacheOff+nTextState], v.Data)
 
-	// For now, we'll use the K and V directly (simplified KV cache handling).
-	// In a full implementation, we'd accumulate all previous K/V and use them for attention.
+	// Retrieve accumulated K and V up to pos+1.
+	// We need [nHead, pos+1, headDim] for both.
+	seqLen := pos + 1
+	kFull := ml.New(d.nHead, seqLen, headDim)
+	vFull := ml.New(d.nHead, seqLen, headDim)
 
-	// Reshape Q, K, V for attention: [nHead, 1, headDim]
+	kLayerOff := layerIdx * 2 * nTextCtx * nTextState
+	vLayerOff := layerIdx*2*nTextCtx*nTextState + 1*nTextCtx*nTextState
+
+	for h := 0; h < d.nHead; h++ {
+		for s := 0; s < seqLen; s++ {
+			srcKOff := kLayerOff + s*nTextState + h*headDim
+			dstKOff := h*seqLen*headDim + s*headDim
+			copy(kFull.Data[dstKOff:dstKOff+headDim], kvCache.Data[srcKOff:srcKOff+headDim])
+
+			srcVOff := vLayerOff + s*nTextState + h*headDim
+			dstVOff := h*seqLen*headDim + s*headDim
+			copy(vFull.Data[dstVOff:dstVOff+headDim], kvCache.Data[srcVOff:srcVOff+headDim])
+		}
+	}
+
+	// Reshape Q for attention: [nHead, 1, headDim]
 	q = q.Reshape(d.nHead, 1, headDim)
-	k = k.Reshape(d.nHead, 1, headDim)
-	v = v.Reshape(d.nHead, 1, headDim)
 
 	// Apply scaled dot-product attention (causal).
-	attnOut, _, err := ml.ScaledDotProductAttention(ctx, q, k, v, true, false)
+	attnOut, _, err := ml.ScaledDotProductAttention(ctx, q, kFull, vFull, true, false)
 	if err != nil {
 		return ml.Tensor{}, fmt.Errorf("model: decode: self_attn: attention: %w", err)
 	}
