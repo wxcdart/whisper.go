@@ -209,3 +209,12 @@ func (f *File) Tensor(ctx context.Context, name string) ([]float32, []int, error
 func (f *File) Close() error {
 	return f.f.Close()
 }
+
+// TensorType returns the quantisation type of the named tensor.
+func (f *File) TensorType(name string) (QuantType, bool) {
+	td, ok := f.tensorIndex[name]
+	if !ok {
+		return 0, false
+	}
+	return QuantType(td.dtype), true
+}

@@ -69,7 +69,7 @@ func quantizeVerbose(ctx context.Context, src, dst string, targetType gguf.Quant
 	}
 	defer f.Close() //nolint:errcheck
 
-	out := gguf.NewFile()
+	out := gguf.NewWritableFile()
 	names := f.TensorNames()
 
 	for _, name := range names {

@@ -56,7 +56,7 @@ func QuantizeFile(ctx context.Context, src, dst string, targetType QuantType) er
 
 	names := f.TensorNames()
 
-	out := NewFile()
+	out := NewWritableFile()
 	out.copyMetaFrom(f)
 
 	type result struct {
