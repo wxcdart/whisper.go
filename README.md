@@ -57,24 +57,28 @@ go build -o download-model ./cmd/download-model
 # List available models
 ./download-model -l
 
-# Download a model (automatically saves as ggml-<model>.gguf)
+# Download GGUF format models (recommended, community conversions)
+./download-model -gguf -l                    # List GGUF models
+./download-model -gguf whisper-large-v3-q8_0  # ~1.6 GB
+./download-model -gguf -o ./models whisper-large-v3-f16  # Custom output dir
+
+# Download old ggml format (legacy, for compatibility)
 ./download-model tiny          # ~39 MB
 ./download-model base          # ~140 MB
 ./download-model small         # ~466 MB
-./download-model -o ./models base  # Custom output directory
+./download-model -o ./models base
 ```
 
-Alternatively, download directly from [ggml-org/whisper.cpp](https://huggingface.co/ggerganov/whisper.cpp/tree/main):
+**Note:** GGUF format is recommended for whisper.go. The old ggml format (`.bin` files) from the original whisper.cpp repository are not directly supported; use GGUF conversions instead.
+
+Alternatively, download manually from [vonjack/whisper-large-v3-gguf](https://huggingface.co/vonjack/whisper-large-v3-gguf):
 
 ```bash
-# Tiny (39 MB)
-wget https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en.gguf
+# Large-v3 Q8_0 (1.6 GB) 
+wget https://huggingface.co/vonjack/whisper-large-v3-gguf/resolve/main/whisper-large-v3-q8_0.gguf
 
-# Base (140 MB)
-wget https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.gguf
-
-# Small (466 MB)
-wget https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.gguf
+# Large-v3 F16 (2.9 GB)
+wget https://huggingface.co/vonjack/whisper-large-v3-gguf/resolve/main/whisper-large-v3-f16.gguf
 ```
 
 ## API
