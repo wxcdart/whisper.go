@@ -1,0 +1,13 @@
+linters:
+  enable:
+    - goimports
+    - govet
+    - errcheck
+    - staticcheck
+    - revive
+    - gosimple
+    - unused
+
+linters-settings:
+  goimports:
+    local-prefixes: github.com/whispergo/whisper.go
