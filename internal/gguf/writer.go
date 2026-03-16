@@ -10,13 +10,14 @@ import (
 )
 
 const (
-	ggufVersion = uint32(3)
-	ggufAlign   = int64(32)
+	ggufMagicU32 = uint32(0x46554747) // 'GGUF' in little-endian
+	ggufVersion  = uint32(3)
+	ggufAlign    = int64(32)
 )
 
-// WriteFile serialises w to a GGUF v3 file at path.
-func WriteFile(ctx context.Context, path string, w *WritableFile) error {
-	return writeGGUF(ctx, path, w)
+// WriteFile serialises f to a GGUF v3 file at path.
+func WriteFile(ctx context.Context, path string, f *WritableFile) error {
+	return writeGGUF(ctx, path, f)
 }
 
 // writeGGUF is the internal GGUF v3 serialiser.
@@ -64,7 +65,7 @@ func writeGGUF(_ context.Context, path string, f *WritableFile) error {
 	bw := bufio.NewWriterSize(file, 1<<20)
 
 	// --- Header ---
-	putU32(bw, uint32(0x46554747)) // "GGUF" little-endian magic
+	putU32(bw, ggufMagicU32)
 	putU32(bw, ggufVersion)
 	putU64(bw, uint64(len(f.tensors)))
 	putU64(bw, uint64(len(f.meta)))
