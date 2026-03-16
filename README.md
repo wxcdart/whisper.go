@@ -48,7 +48,23 @@ whisper -f audio.wav -m ggml-medium.gguf --vad --vad-model silero-vad.gguf -dtw
 
 ### Download Models
 
-Get GGUF models from [ggml-org/whisper.cpp](https://huggingface.co/ggerganov/whisper.cpp/tree/main):
+Build the download utility and use it to fetch models:
+
+```bash
+# Build downloader
+go build -o download-model ./cmd/download-model
+
+# List available models
+./download-model -l
+
+# Download a model (automatically saves as ggml-<model>.gguf)
+./download-model tiny          # ~39 MB
+./download-model base          # ~140 MB
+./download-model small         # ~466 MB
+./download-model -o ./models base  # Custom output directory
+```
+
+Alternatively, download directly from [ggml-org/whisper.cpp](https://huggingface.co/ggerganov/whisper.cpp/tree/main):
 
 ```bash
 # Tiny (39 MB)
