@@ -16,6 +16,11 @@ type Decoder interface {
 	Decode(ctx context.Context, encoderOut ml.Tensor, params DecoderParams) ([]Segment, error)
 }
 
+// DTWAligner performs dynamic time warping alignment.
+type DTWAligner interface {
+	Align(ctx context.Context, attention [][]float32, logits [][]float32) ([]TokenData, error)
+}
+
 // Transcriber runs the full encode+decode pipeline over chunked audio.
 type Transcriber interface {
 	Transcribe(ctx context.Context, samples []float32, params TranscribeParams) (*Result, error)
