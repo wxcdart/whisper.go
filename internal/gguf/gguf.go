@@ -205,6 +205,15 @@ func (f *File) Tensor(ctx context.Context, name string) ([]float32, []int, error
 	return out, shape, nil
 }
 
+// TensorType returns the QuantType of the named tensor, or (QuantF32, false) if not found.
+func (f *File) TensorType(name string) (QuantType, bool) {
+	td, ok := f.tensorIndex[name]
+	if !ok {
+		return QuantF32, false
+	}
+	return QuantType(td.dtype), true
+}
+
 // Close releases file resources.
 func (f *File) Close() error {
 	return f.f.Close()

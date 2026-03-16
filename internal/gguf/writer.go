@@ -10,18 +10,18 @@ import (
 )
 
 const (
-	ggufMagic   = uint32(0x46554747) // 'GGUF' in little-endian
-	ggufVersion = uint32(3)
-	ggufAlign   = int64(32)
+	ggufMagicU32 = uint32(0x46554747) // 'GGUF' in little-endian
+	ggufVersion  = uint32(3)
+	ggufAlign    = int64(32)
 )
 
 // WriteFile serialises f to a GGUF v3 file at path.
-func WriteFile(ctx context.Context, path string, f *File) error {
+func WriteFile(ctx context.Context, path string, f *WritableFile) error {
 	return writeGGUF(ctx, path, f)
 }
 
 // writeGGUF is the internal GGUF v3 serialiser.
-func writeGGUF(_ context.Context, path string, f *File) error {
+func writeGGUF(_ context.Context, path string, f *WritableFile) error {
 	// Pre-compute header size so we can calculate the data section alignment
 	// and tensor offsets before we start writing.
 	headerSize := int64(4 + 4 + 8 + 8) // magic + version + tensor_count + meta_count
@@ -65,7 +65,7 @@ func writeGGUF(_ context.Context, path string, f *File) error {
 	bw := bufio.NewWriterSize(file, 1<<20)
 
 	// --- Header ---
-	putU32(bw, ggufMagic)
+	putU32(bw, ggufMagicU32)
 	putU32(bw, ggufVersion)
 	putU64(bw, uint64(len(f.tensors)))
 	putU64(bw, uint64(len(f.meta)))
