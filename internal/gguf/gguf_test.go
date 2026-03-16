@@ -12,8 +12,8 @@ import (
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
-func putU32(b []byte, v uint32) { binary.LittleEndian.PutUint32(b, v) }
-func putU64(b []byte, v uint64) { binary.LittleEndian.PutUint64(b, v) }
+func testPutU32(b []byte, v uint32) { binary.LittleEndian.PutUint32(b, v) }
+func testPutU64(b []byte, v uint64) { binary.LittleEndian.PutUint64(b, v) }
 
 type testMeta struct {
 	key   string
@@ -36,17 +36,17 @@ func buildTestGGUF(t *testing.T, metas []testMeta, tensors []testTensor) string 
 
 	// Header
 	buf.WriteString("GGUF")
-	putU32(tmp[:4], 2)
+	testPutU32(tmp[:4], 2)
 	buf.Write(tmp[:4])
-	putU64(tmp[:], uint64(len(tensors)))
+	testPutU64(tmp[:], uint64(len(tensors)))
 	buf.Write(tmp[:])
-	putU64(tmp[:], uint64(len(metas)))
+	testPutU64(tmp[:], uint64(len(metas)))
 	buf.Write(tmp[:])
 
 	// Metadata entries
 	for _, m := range metas {
 		writeTestStr(&buf, m.key)
-		putU32(tmp[:4], m.vtype)
+		testPutU32(tmp[:4], m.vtype)
 		buf.Write(tmp[:4])
 		writeTestVal(t, &buf, m.vtype, m.val)
 	}
@@ -60,15 +60,15 @@ func buildTestGGUF(t *testing.T, metas []testMeta, tensors []testTensor) string 
 	}
 	for i, tn := range tensors {
 		writeTestStr(&buf, tn.name)
-		putU32(tmp[:4], uint32(len(tn.shape)))
+		testPutU32(tmp[:4], uint32(len(tn.shape)))
 		buf.Write(tmp[:4])
 		for _, d := range tn.shape {
-			putU64(tmp[:], d)
+			testPutU64(tmp[:], d)
 			buf.Write(tmp[:])
 		}
-		putU32(tmp[:4], tn.dtype)
+		testPutU32(tmp[:4], tn.dtype)
 		buf.Write(tmp[:4])
-		putU64(tmp[:], offsets[i])
+		testPutU64(tmp[:], offsets[i])
 		buf.Write(tmp[:])
 	}
 
@@ -97,7 +97,7 @@ func buildTestGGUF(t *testing.T, metas []testMeta, tensors []testTensor) string 
 
 func writeTestStr(w *bytes.Buffer, s string) {
 	var tmp [8]byte
-	putU64(tmp[:], uint64(len(s)))
+	testPutU64(tmp[:], uint64(len(s)))
 	w.Write(tmp[:])
 	w.WriteString(s)
 }
@@ -109,28 +109,28 @@ func writeTestVal(t *testing.T, w *bytes.Buffer, vtype uint32, val any) {
 	case typeString:
 		writeTestStr(w, val.(string))
 	case typeUint32:
-		putU32(tmp[:4], val.(uint32))
+		testPutU32(tmp[:4], val.(uint32))
 		w.Write(tmp[:4])
 	case typeFloat32:
-		putU32(tmp[:4], math.Float32bits(val.(float32)))
+		testPutU32(tmp[:4], math.Float32bits(val.(float32)))
 		w.Write(tmp[:4])
 	case typeArray:
 		switch v := val.(type) {
 		case []string:
-			putU32(tmp[:4], typeString)
+			testPutU32(tmp[:4], typeString)
 			w.Write(tmp[:4])
-			putU64(tmp[:], uint64(len(v)))
+			testPutU64(tmp[:], uint64(len(v)))
 			w.Write(tmp[:])
 			for _, s := range v {
 				writeTestStr(w, s)
 			}
 		case []uint32:
-			putU32(tmp[:4], typeUint32)
+			testPutU32(tmp[:4], typeUint32)
 			w.Write(tmp[:4])
-			putU64(tmp[:], uint64(len(v)))
+			testPutU64(tmp[:], uint64(len(v)))
 			w.Write(tmp[:])
 			for _, u := range v {
-				putU32(tmp[:4], u)
+				testPutU32(tmp[:4], u)
 				w.Write(tmp[:4])
 			}
 		default:
@@ -412,7 +412,7 @@ func TestOpenUnsupportedVersion(t *testing.T) {
 	var buf bytes.Buffer
 	buf.WriteString("GGUF")
 	var tmp [4]byte
-	putU32(tmp[:], 5) // unsupported version
+	testPutU32(tmp[:], 5) // unsupported version
 	buf.Write(tmp[:])
 
 	f, err := os.CreateTemp(t.TempDir(), "ver-*.gguf")

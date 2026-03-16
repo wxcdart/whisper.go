@@ -26,31 +26,31 @@ func TestQuantRoundTrip(t *testing.T) {
 		{
 			name:   "Q4_0",
 			encode: QuantizeQ4_0,
-			decode: dequantQ4_0,
+			decode: testDequantQ4_0,
 			maxErr: 0.1,
 		},
 		{
 			name:   "Q4_1",
 			encode: QuantizeQ4_1,
-			decode: dequantQ4_1,
+			decode: testDequantQ4_1,
 			maxErr: 0.1,
 		},
 		{
 			name:   "Q5_0",
 			encode: QuantizeQ5_0,
-			decode: dequantQ5_0,
+			decode: testDequantQ5_0,
 			maxErr: 0.05,
 		},
 		{
 			name:   "Q5_1",
 			encode: QuantizeQ5_1,
-			decode: dequantQ5_1,
+			decode: testDequantQ5_1,
 			maxErr: 0.05,
 		},
 		{
 			name:   "Q8_0",
 			encode: QuantizeQ8_0,
-			decode: dequantQ8_0,
+			decode: testDequantQ8_0,
 			maxErr: 0.01,
 		},
 		{
@@ -138,7 +138,7 @@ func dequantF16(data []byte) []float32 {
 	return out
 }
 
-func dequantQ4_0(data []byte) []float32 {
+func testDequantQ4_0(data []byte) []float32 {
 	const stride = 18
 	nBlocks := len(data) / stride
 	out := make([]float32, nBlocks*blockSize)
@@ -158,7 +158,7 @@ func dequantQ4_0(data []byte) []float32 {
 	return out
 }
 
-func dequantQ4_1(data []byte) []float32 {
+func testDequantQ4_1(data []byte) []float32 {
 	const stride = 20
 	nBlocks := len(data) / stride
 	out := make([]float32, nBlocks*blockSize)
@@ -179,7 +179,7 @@ func dequantQ4_1(data []byte) []float32 {
 	return out
 }
 
-func dequantQ5_0(data []byte) []float32 {
+func testDequantQ5_0(data []byte) []float32 {
 	const stride = 22
 	nBlocks := len(data) / stride
 	out := make([]float32, nBlocks*blockSize)
@@ -202,7 +202,7 @@ func dequantQ5_0(data []byte) []float32 {
 	return out
 }
 
-func dequantQ5_1(data []byte) []float32 {
+func testDequantQ5_1(data []byte) []float32 {
 	const stride = 24
 	nBlocks := len(data) / stride
 	out := make([]float32, nBlocks*blockSize)
@@ -226,7 +226,7 @@ func dequantQ5_1(data []byte) []float32 {
 	return out
 }
 
-func dequantQ8_0(data []byte) []float32 {
+func testDequantQ8_0(data []byte) []float32 {
 	const stride = 34
 	nBlocks := len(data) / stride
 	out := make([]float32, nBlocks*blockSize)
