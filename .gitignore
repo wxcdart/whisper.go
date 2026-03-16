@@ -26,3 +26,6 @@ testdata/models/
 
 # Build artifacts
 build/
+quantize
+download-model
+whisper
