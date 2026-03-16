@@ -39,6 +39,10 @@ func (p *WhisperPipeline) Transcribe(ctx context.Context, samples []float32, par
 		return nil, ctx.Err()
 	}
 
+	if params.Logger != nil {
+		params.Logger.Info("starting transcription", "samples", len(samples))
+	}
+
 	if len(samples) == 0 {
 		return &Result{Segments: []Segment{}, Language: ""}, nil
 	}
@@ -62,9 +66,15 @@ func (p *WhisperPipeline) Transcribe(ctx context.Context, samples []float32, par
 	if params.AutoDetectLanguage {
 		lang, err := p.detectLanguage(ctx, samples[:minInt(len(samples), windowSamples)], params)
 		if err != nil {
+			if params.Logger != nil {
+				params.Logger.Error("language detection failed", "error", err)
+			}
 			return nil, fmt.Errorf("pipeline: language detection: %w", err)
 		}
 		result.Language = lang
+		if params.Logger != nil {
+			params.Logger.Info("language detected", "lang", lang)
+		}
 	} else if params.Language != "" {
 		result.Language = params.Language
 	}
@@ -73,6 +83,10 @@ func (p *WhisperPipeline) Transcribe(ctx context.Context, samples []float32, par
 	for chunkIdx := 0; chunkIdx < numChunks; chunkIdx++ {
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
+		}
+
+		if params.Logger != nil {
+			params.Logger.Debug("processing chunk", "index", chunkIdx, "total", numChunks)
 		}
 
 		// Extract chunk with overlap
@@ -94,6 +108,9 @@ func (p *WhisperPipeline) Transcribe(ctx context.Context, samples []float32, par
 				return nil, fmt.Errorf("pipeline: vad detection: %w", err)
 			}
 			if len(segments) == 0 {
+				if params.Logger != nil {
+					params.Logger.Debug("no speech detected in chunk", "index", chunkIdx)
+				}
 				continue
 			}
 		}
@@ -142,6 +159,10 @@ func (p *WhisperPipeline) Transcribe(ctx context.Context, samples []float32, par
 		processedSegments, err := p.postProcessSegments(ctx, segments, params, int64(startSample)*1000/int64(audio.SampleRate))
 		if err != nil {
 			return nil, fmt.Errorf("pipeline: post-processing: %w", err)
+		}
+
+		if params.Logger != nil && len(processedSegments) > 0 {
+			params.Logger.Info("chunk transcribed", "index", chunkIdx, "segments", len(processedSegments))
 		}
 
 		result.Segments = append(result.Segments, processedSegments...)

@@ -6,6 +6,14 @@ import (
 	"github.com/whispergo/whisper.go/internal/ml"
 )
 
+// Logger is a simple interface for structured logging.
+type Logger interface {
+	Debug(msg string, args ...any)
+	Info(msg string, args ...any)
+	Warn(msg string, args ...any)
+	Error(msg string, args ...any)
+}
+
 // Encoder converts a log-mel spectrogram into encoder hidden states.
 type Encoder interface {
 	Encode(ctx context.Context, mel ml.Tensor) (out ml.Tensor, err error)
@@ -99,4 +107,5 @@ type TranscribeParams struct {
 	Threads            int
 	VADEnabled         bool
 	VADModelPath       string
+	Logger             Logger
 }
