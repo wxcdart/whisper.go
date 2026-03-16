@@ -29,12 +29,43 @@ type File struct {
 	dataStart   int64
 }
 
-// Open parses a GGUF file and returns a File ready to read metadata and tensors.
+// Open parses a GGUF or old GGML file and returns a File ready to read metadata and tensors.
+// Supports both new GGUF format (magic "GGUF") and old ggml format (magic "lmgg").
 func Open(ctx context.Context, path string) (*File, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, fmt.Errorf("gguf: open: %w", err)
 	}
+
+	// Peek at magic to determine format
+	var mag [4]byte
+	if _, err := io.ReadFull(f, mag[:]); err != nil {
+		f.Close()
+		return nil, fmt.Errorf("gguf: read magic: %w", err)
+	}
+
+	// Reset to beginning for format-specific parsing
+	if _, err := f.Seek(0, 0); err != nil {
+		f.Close()
+		return nil, fmt.Errorf("gguf: seek: %w", err)
+	}
+
+	magicStr := string(mag[:])
+	switch magicStr {
+	case ggufMagic:
+		// Parse as GGUF v3
+		return parseGGUF(ctx, f)
+	case "lmgg":
+		// Parse as old ggml format
+		return parseOldGGML(ctx, f)
+	default:
+		f.Close()
+		return nil, fmt.Errorf("gguf: unknown format magic: %s", magicStr)
+	}
+}
+
+// parseGGUF parses GGUF v3 format.
+func parseGGUF(ctx context.Context, f *os.File) (*File, error) {
 	file := &File{
 		f:           f,
 		meta:        make(map[string]any),
@@ -44,6 +75,34 @@ func Open(ctx context.Context, path string) (*File, error) {
 		f.Close()
 		return nil, err
 	}
+	return file, nil
+}
+
+// parseOldGGML parses old ggml binary format and converts to GGUF-compatible structure.
+func parseOldGGML(ctx context.Context, f *os.File) (*File, error) {
+	// Parse old format to extract tensors and metadata
+	tensors, metadata, err := loadOldGGMLFormat(f)
+	if err != nil {
+		f.Close()
+		return nil, fmt.Errorf("gguf: parse old ggml: %w", err)
+	}
+
+	// Create File structure
+	file := &File{
+		f:           f,
+		meta:        metadata,
+		tensors:     tensors,
+		tensorIndex: make(map[string]*tensorDesc),
+	}
+
+	// Build tensor index
+	for i := range file.tensors {
+		file.tensorIndex[file.tensors[i].name] = &file.tensors[i]
+	}
+
+	// Set data start (tensor data begins immediately after header)
+	file.dataStart = 0
+
 	return file, nil
 }
 
