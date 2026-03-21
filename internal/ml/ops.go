@@ -77,7 +77,21 @@ func GELUInto(dst, src Tensor) error {
 		return fmt.Errorf("%w: GELUInto: dst=%v src=%v", ErrShapeMismatch, dst.Shape, src.Shape)
 	}
 	const sqrt2OverPi = 0.7978845608028654
-	for i, x := range src.Data {
+	n := len(src.Data)
+	i := 0
+	for ; i+3 < n; i += 4 {
+		x0, x1, x2, x3 := src.Data[i], src.Data[i+1], src.Data[i+2], src.Data[i+3]
+		i0 := sqrt2OverPi * (x0 + 0.044715*x0*x0*x0)
+		i1 := sqrt2OverPi * (x1 + 0.044715*x1*x1*x1)
+		i2 := sqrt2OverPi * (x2 + 0.044715*x2*x2*x2)
+		i3 := sqrt2OverPi * (x3 + 0.044715*x3*x3*x3)
+		dst.Data[i] = x0 * 0.5 * float32(1+math.Tanh(float64(i0)))
+		dst.Data[i+1] = x1 * 0.5 * float32(1+math.Tanh(float64(i1)))
+		dst.Data[i+2] = x2 * 0.5 * float32(1+math.Tanh(float64(i2)))
+		dst.Data[i+3] = x3 * 0.5 * float32(1+math.Tanh(float64(i3)))
+	}
+	for ; i < n; i++ {
+		x := src.Data[i]
 		inner := sqrt2OverPi * (x + 0.044715*x*x*x)
 		dst.Data[i] = x * 0.5 * float32(1+math.Tanh(float64(inner)))
 	}
@@ -87,7 +101,21 @@ func GELUInto(dst, src Tensor) error {
 // GELUInPlace applies GELU in place.
 func GELUInPlace(t Tensor) {
 	const sqrt2OverPi = 0.7978845608028654
-	for i, x := range t.Data {
+	n := len(t.Data)
+	i := 0
+	for ; i+3 < n; i += 4 {
+		x0, x1, x2, x3 := t.Data[i], t.Data[i+1], t.Data[i+2], t.Data[i+3]
+		i0 := sqrt2OverPi * (x0 + 0.044715*x0*x0*x0)
+		i1 := sqrt2OverPi * (x1 + 0.044715*x1*x1*x1)
+		i2 := sqrt2OverPi * (x2 + 0.044715*x2*x2*x2)
+		i3 := sqrt2OverPi * (x3 + 0.044715*x3*x3*x3)
+		t.Data[i] = x0 * 0.5 * float32(1+math.Tanh(float64(i0)))
+		t.Data[i+1] = x1 * 0.5 * float32(1+math.Tanh(float64(i1)))
+		t.Data[i+2] = x2 * 0.5 * float32(1+math.Tanh(float64(i2)))
+		t.Data[i+3] = x3 * 0.5 * float32(1+math.Tanh(float64(i3)))
+	}
+	for ; i < n; i++ {
+		x := t.Data[i]
 		inner := sqrt2OverPi * (x + 0.044715*x*x*x)
 		t.Data[i] = x * 0.5 * float32(1+math.Tanh(float64(inner)))
 	}
@@ -136,17 +164,30 @@ func LayerNormInto(dst, t, weight, bias Tensor, eps float32) error {
 
 	rows := t.Size() / C
 	for r := 0; r < rows; r++ {
-		srcRow := t.Data[r*C : (r+1)*C]
-		dstRow := dst.Data[r*C : (r+1)*C]
+		start := r * C
+		srcRow := t.Data[start : start+C : start+C]
+		dstRow := dst.Data[start : start+C : start+C]
 		var mean float32
-		for _, v := range srcRow {
-			mean += v
+		i := 0
+		for ; i+3 < C; i += 4 {
+			mean += srcRow[i] + srcRow[i+1] + srcRow[i+2] + srcRow[i+3]
+		}
+		for ; i < C; i++ {
+			mean += srcRow[i]
 		}
 		mean /= float32(C)
 
 		var vari float32
-		for _, v := range srcRow {
-			d := v - mean
+		i = 0
+		for ; i+3 < C; i += 4 {
+			d0 := srcRow[i] - mean
+			d1 := srcRow[i+1] - mean
+			d2 := srcRow[i+2] - mean
+			d3 := srcRow[i+3] - mean
+			vari += d0*d0 + d1*d1 + d2*d2 + d3*d3
+		}
+		for ; i < C; i++ {
+			d := srcRow[i] - mean
 			vari += d * d
 		}
 		vari /= float32(C)

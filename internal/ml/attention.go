@@ -26,6 +26,11 @@ const (
 	ln2    float32 = 0.6931471805599453
 )
 
+var (
+	softmaxRowFastKernel  = softmaxRowFastInPlaceGeneric
+	softmaxRowExactKernel = softmaxRowExactInPlaceGeneric
+)
+
 func fastExpApprox(x float32) float32 {
 	// Softmax uses x <= 0 (after subtracting max); large negative values are effectively zero.
 	if x <= -20 {
@@ -53,6 +58,124 @@ func fastExpApprox(x float32) float32 {
 	}
 	twoPowK := math.Float32frombits(uint32(k+127) << 23)
 	return poly * twoPowK
+}
+
+func rowMaxUnrolled(row []float32) float32 {
+	maxVal := row[0]
+	i := 1
+	n := len(row)
+	for ; i+3 < n; i += 4 {
+		v0 := row[i]
+		v1 := row[i+1]
+		v2 := row[i+2]
+		v3 := row[i+3]
+		if v0 > maxVal {
+			maxVal = v0
+		}
+		if v1 > maxVal {
+			maxVal = v1
+		}
+		if v2 > maxVal {
+			maxVal = v2
+		}
+		if v3 > maxVal {
+			maxVal = v3
+		}
+	}
+	for ; i < n; i++ {
+		if row[i] > maxVal {
+			maxVal = row[i]
+		}
+	}
+	return maxVal
+}
+
+func softmaxRowFastInPlaceGeneric(row []float32) {
+	maxVal := rowMaxUnrolled(row)
+	n := len(row)
+	var sum float32
+	i := 0
+	for ; i+3 < n; i += 4 {
+		x0 := fastExpApprox(row[i] - maxVal)
+		x1 := fastExpApprox(row[i+1] - maxVal)
+		x2 := fastExpApprox(row[i+2] - maxVal)
+		x3 := fastExpApprox(row[i+3] - maxVal)
+		row[i] = x0
+		row[i+1] = x1
+		row[i+2] = x2
+		row[i+3] = x3
+		sum += x0 + x1 + x2 + x3
+	}
+	for ; i < n; i++ {
+		x := fastExpApprox(row[i] - maxVal)
+		row[i] = x
+		sum += x
+	}
+	if sum == 0 {
+		inv := 1.0 / float32(n)
+		for i := range row {
+			row[i] = inv
+		}
+		return
+	}
+	invSum := 1 / sum
+	for i := 0; i+3 < n; i += 4 {
+		row[i] *= invSum
+		row[i+1] *= invSum
+		row[i+2] *= invSum
+		row[i+3] *= invSum
+	}
+	for i := n &^ 3; i < n; i++ {
+		row[i] *= invSum
+	}
+}
+
+func softmaxRowExactInPlaceGeneric(row []float32) {
+	maxVal := rowMaxUnrolled(row)
+	n := len(row)
+	var sum float32
+	i := 0
+	for ; i+3 < n; i += 4 {
+		x0 := float32(math.Exp(float64(row[i] - maxVal)))
+		x1 := float32(math.Exp(float64(row[i+1] - maxVal)))
+		x2 := float32(math.Exp(float64(row[i+2] - maxVal)))
+		x3 := float32(math.Exp(float64(row[i+3] - maxVal)))
+		row[i] = x0
+		row[i+1] = x1
+		row[i+2] = x2
+		row[i+3] = x3
+		sum += x0 + x1 + x2 + x3
+	}
+	for ; i < n; i++ {
+		x := float32(math.Exp(float64(row[i] - maxVal)))
+		row[i] = x
+		sum += x
+	}
+	if sum == 0 {
+		inv := 1.0 / float32(n)
+		for i := range row {
+			row[i] = inv
+		}
+		return
+	}
+	invSum := 1 / sum
+	for i := 0; i+3 < n; i += 4 {
+		row[i] *= invSum
+		row[i+1] *= invSum
+		row[i+2] *= invSum
+		row[i+3] *= invSum
+	}
+	for i := n &^ 3; i < n; i++ {
+		row[i] *= invSum
+	}
+}
+
+func softmaxRowFastInPlace(row []float32) {
+	softmaxRowFastKernel(row)
+}
+
+func softmaxRowExactInPlace(row []float32) {
+	softmaxRowExactKernel(row)
 }
 
 // ScaledDotProductAttention computes Attention(Q, K, V) with optional causal masking.
@@ -134,36 +257,10 @@ func ScaledDotProductAttentionInto(ctx context.Context, q, k, v Tensor, causal b
 
 			for i := 0; i < Tq; i++ {
 				row := scores[i*Tk : (i+1)*Tk]
-				maxVal := row[0]
-				for _, val := range row[1:] {
-					if val > maxVal {
-						maxVal = val
-					}
-				}
-
-				var sum float32
 				if attentionUseFastExp {
-					for j := range row {
-						row[j] = fastExpApprox(row[j] - maxVal)
-						sum += row[j]
-					}
+					softmaxRowFastInPlace(row)
 				} else {
-					for j := range row {
-						row[j] = float32(math.Exp(float64(row[j] - maxVal)))
-						sum += row[j]
-					}
-				}
-
-				if sum == 0 {
-					inv := 1.0 / float32(len(row))
-					for j := range row {
-						row[j] = inv
-					}
-					continue
-				}
-				invSum := 1 / sum
-				for j := range row {
-					row[j] *= invSum
+					softmaxRowExactInPlace(row)
 				}
 			}
 

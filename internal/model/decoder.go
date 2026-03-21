@@ -938,8 +938,9 @@ func (d *WhisperDecoder) topKTokensWithScratch(logits []float32, k int, temperat
 	if len(logits) != d.nVocab || k <= 0 {
 		return nil, top
 	}
+	vals := logits[:len(logits):len(logits)]
 	if k > len(logits) {
-		k = len(logits)
+		k = len(vals)
 	}
 
 	invTemp := float32(1.0)
@@ -956,7 +957,7 @@ func (d *WhisperDecoder) topKTokensWithScratch(logits []float32, k int, temperat
 	minVal := float32(0)
 
 	scaledMax := float32(math.Inf(-1))
-	for i, lg := range logits {
+	for i, lg := range vals {
 		s := lg * invTemp
 		if s > scaledMax {
 			scaledMax = s
@@ -987,7 +988,7 @@ func (d *WhisperDecoder) topKTokensWithScratch(logits []float32, k int, temperat
 	}
 
 	expSum := float32(0)
-	for _, lg := range logits {
+	for _, lg := range vals {
 		expSum += float32(math.Exp(float64(lg*invTemp - scaledMax)))
 	}
 	logZ := float32(math.Log(float64(expSum))) + scaledMax
