@@ -12,17 +12,17 @@ import (
 
 // decoderCrossAttn holds Q/K/V/out weights for cross-attention to encoder output.
 type decoderCrossAttn struct {
-	qW, qB    ml.Tensor // [nTextState, nTextState], [nTextState]
-	kW, vW    ml.Tensor // [nTextState, nTextState] (no bias)
-	vB        ml.Tensor // [nTextState]
+	qW, qB     ml.Tensor // [nTextState, nTextState], [nTextState]
+	kW, vW     ml.Tensor // [nTextState, nTextState] (no bias)
+	vB         ml.Tensor // [nTextState]
 	outW, outB ml.Tensor // [nTextState, nTextState], [nTextState]
 }
 
 // decoderSelfAttn holds Q/K/V/out weights for causal self-attention (with KV cache).
 type decoderSelfAttn struct {
-	qW, qB    ml.Tensor // [nTextState, nTextState], [nTextState]
-	kW        ml.Tensor // [nTextState, nTextState] (no bias)
-	vW, vB    ml.Tensor // [nTextState, nTextState], [nTextState]
+	qW, qB     ml.Tensor // [nTextState, nTextState], [nTextState]
+	kW         ml.Tensor // [nTextState, nTextState] (no bias)
+	vW, vB     ml.Tensor // [nTextState, nTextState], [nTextState]
 	outW, outB ml.Tensor // [nTextState, nTextState], [nTextState]
 }
 
@@ -30,11 +30,11 @@ type decoderSelfAttn struct {
 type decoderBlock struct {
 	// Self-attention
 	sAttnLnW, sAttnLnB ml.Tensor // [nTextState]
-	selfAttn            decoderSelfAttn
+	selfAttn           decoderSelfAttn
 
 	// Cross-attention
 	cAttnLnW, cAttnLnB ml.Tensor // [nTextState]
-	crossAttn           decoderCrossAttn
+	crossAttn          decoderCrossAttn
 
 	// MLP
 	mlpLnW, mlpLnB ml.Tensor // [nTextState]
@@ -44,11 +44,11 @@ type decoderBlock struct {
 
 // WhisperDecoder implements the Decoder interface.
 type WhisperDecoder struct {
-	nVocab      int
-	nTextState  int
-	nHead       int
-	nTextLayer  int
-	nTextCtx    int
+	nVocab     int
+	nTextState int
+	nHead      int
+	nTextLayer int
+	nTextCtx   int
 
 	// Embeddings
 	tokenEmb ml.Tensor // [nVocab, nTextState]
@@ -293,27 +293,27 @@ func NewDecoder(f *gguf.File) (*WhisperDecoder, error) {
 
 // decoderState holds the running state during decoding.
 type decoderState struct {
-	tokens      []int32      // Current token sequence
-	logits      []float32    // Latest logits [nVocab]
-	kvCache     ml.Tensor    // [nLayer, 2, seqLen, nTextState]
-	cachedPos   int          // Number of positions cached
-	crossK      []ml.Tensor  // per-layer cached projected encoder K [encLen, nTextState]
-	crossV      []ml.Tensor  // per-layer cached projected encoder V [encLen, nTextState]
-	crossReady  []bool       // whether crossK/crossV are initialized for layer
-	scratch     decoderScratch
+	tokens     []int32     // Current token sequence
+	logits     []float32   // Latest logits [nVocab]
+	kvCache    ml.Tensor   // [nLayer, 2, seqLen, nTextState]
+	cachedPos  int         // Number of positions cached
+	crossK     []ml.Tensor // per-layer cached projected encoder K [encLen, nTextState]
+	crossV     []ml.Tensor // per-layer cached projected encoder V [encLen, nTextState]
+	crossReady []bool      // whether crossK/crossV are initialized for layer
+	scratch    decoderScratch
 }
 
 type decoderScratch struct {
-	x       ml.Tensor // [1, nTextState]
-	xln     ml.Tensor // [1, nTextState]
-	q       ml.Tensor // [1, nTextState]
-	k       ml.Tensor // [1, nTextState]
-	v       ml.Tensor // [1, nTextState]
-	out     ml.Tensor // [1, nTextState]
-	mlpH    ml.Tensor // [1, 4*nTextState]
-	kFull   ml.Tensor // [nHead, nTextCtx, headDim]
-	vFull   ml.Tensor // [nHead, nTextCtx, headDim]
-	logits  ml.Tensor // [1, nVocab]
+	x      ml.Tensor // [1, nTextState]
+	xln    ml.Tensor // [1, nTextState]
+	q      ml.Tensor // [1, nTextState]
+	k      ml.Tensor // [1, nTextState]
+	v      ml.Tensor // [1, nTextState]
+	out    ml.Tensor // [1, nTextState]
+	mlpH   ml.Tensor // [1, 4*nTextState]
+	kFull  ml.Tensor // [nHead, nTextCtx, headDim]
+	vFull  ml.Tensor // [nHead, nTextCtx, headDim]
+	logits ml.Tensor // [1, nVocab]
 }
 
 func (d *WhisperDecoder) newDecoderState(prompt []int32) *decoderState {
@@ -490,8 +490,8 @@ func (d *WhisperDecoder) decodeBeamSearch(ctx context.Context, encoderOut ml.Ten
 			if len(hyp.tokens) > 0 && hyp.tokens[len(hyp.tokens)-1] == d.eotToken {
 				// This hypothesis has reached EOT, keep it unchanged.
 				allCandidates = append(allCandidates, &beamCandidate{
-					hyp:    hyp,
-					token:  d.eotToken,
+					hyp:     hyp,
+					token:   d.eotToken,
 					logprob: 0,
 				})
 				continue

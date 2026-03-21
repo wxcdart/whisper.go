@@ -152,4 +152,3 @@ func matmulBatched(ctx context.Context, a, b Tensor, transB bool) (Tensor, error
 
 	return c, nil
 }
-
