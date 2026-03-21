@@ -485,7 +485,7 @@ func (d *WhisperDecoder) decodeBeamSearch(ctx context.Context, encoderOut ml.Ten
 	}
 
 	allCandidates := make([]beamCandidate, 0, beamSize*6)
-	reusableStates := make([]*decoderState, beamSize)
+	reusableBeams := make([]*beam, 0, beamSize)
 
 	for step := 0; step < maxTokens; step++ {
 		if err := ctx.Err(); err != nil {
@@ -494,14 +494,15 @@ func (d *WhisperDecoder) decodeBeamSearch(ctx context.Context, encoderOut ml.Ten
 
 		// Compute logits for all beam hypotheses.
 		allCandidates = allCandidates[:0]
+		reusableBeams = reusableBeams[:0]
 
-		for bi, hyp := range beams {
-			reusableStates[bi] = hyp.state
+		for _, hyp := range beams {
+			reusableBeams = append(reusableBeams, hyp)
 			if len(hyp.tokens) > 0 && hyp.tokens[len(hyp.tokens)-1] == d.eotToken {
 				// This hypothesis has reached EOT, keep it unchanged.
 				normScore := hyp.score / float32(math.Pow(float64(len(hyp.tokens)), 0.6))
 				allCandidates = append(allCandidates, beamCandidate{
-					tokens:    hyp.tokens,
+					parent:    hyp,
 					score:     hyp.score,
 					token:     d.eotToken,
 					logprob:   0,
@@ -522,15 +523,12 @@ func (d *WhisperDecoder) decodeBeamSearch(ctx context.Context, encoderOut ml.Ten
 			hyp.state.scratch.topK = topBuf
 
 			for _, candidate := range candidates {
-				newTokens := make([]int32, len(hyp.tokens)+1)
-				copy(newTokens, hyp.tokens)
-				newTokens[len(hyp.tokens)] = candidate.token
+				newLen := len(hyp.tokens) + 1
 				newScore := hyp.score + candidate.logprob
-
 				// Normalize score by sequence length (length penalty).
-				normScore := newScore / float32(math.Pow(float64(len(newTokens)), 0.6))
+				normScore := newScore / float32(math.Pow(float64(newLen), 0.6))
 				allCandidates = append(allCandidates, beamCandidate{
-					tokens:    newTokens,
+					parent:    hyp,
 					score:     newScore,
 					token:     candidate.token,
 					logprob:   candidate.logprob,
@@ -545,12 +543,34 @@ func (d *WhisperDecoder) decodeBeamSearch(ctx context.Context, encoderOut ml.Ten
 		// Update beams with top candidates.
 		nextBeams := make([]*beam, len(bestCandidates))
 		for i, cand := range bestCandidates {
-			state := reusableStates[i]
-			if state == nil {
-				state = d.newDecoderState(nil)
+			var nb *beam
+			if n := len(reusableBeams); n > 0 {
+				nb = reusableBeams[n-1]
+				reusableBeams = reusableBeams[:n-1]
+			} else {
+				nb = &beam{state: d.newDecoderState(nil)}
 			}
-			nextBeams[i] = &beam{tokens: cand.tokens, score: cand.score, state: state}
-			reusableStates[i] = nil
+
+			if len(cand.parent.tokens) > 0 && cand.parent.tokens[len(cand.parent.tokens)-1] == d.eotToken && cand.token == d.eotToken && cand.logprob == 0 {
+				if cap(nb.tokens) < len(cand.parent.tokens) {
+					nb.tokens = make([]int32, len(cand.parent.tokens))
+				} else {
+					nb.tokens = nb.tokens[:len(cand.parent.tokens)]
+				}
+				copy(nb.tokens, cand.parent.tokens)
+			} else {
+				newLen := len(cand.parent.tokens) + 1
+				if cap(nb.tokens) < newLen {
+					nb.tokens = make([]int32, newLen)
+				} else {
+					nb.tokens = nb.tokens[:newLen]
+				}
+				copy(nb.tokens, cand.parent.tokens)
+				nb.tokens[newLen-1] = cand.token
+			}
+
+			nb.score = cand.score
+			nextBeams[i] = nb
 		}
 		beams = nextBeams
 
@@ -583,7 +603,7 @@ type beam struct {
 
 // beamCandidate represents a candidate token for beam expansion.
 type beamCandidate struct {
-	tokens    []int32
+	parent    *beam
 	score     float32
 	token     int32
 	logprob   float32
