@@ -296,12 +296,17 @@ func NewDecoder(f *gguf.File) (*WhisperDecoder, error) {
 type decoderState struct {
 	tokens     []int32     // Current token sequence
 	logits     []float32   // Latest logits [nVocab]
-	kvCache    ml.Tensor   // [nLayer, 2, seqLen, nTextState]
+	kvCache    ml.Tensor   // [nLayer, 2, nHead, nTextCtx, headDim]
 	cachedPos  int         // Number of positions cached
 	crossK     []ml.Tensor // per-layer cached projected encoder K [encLen, nTextState]
 	crossV     []ml.Tensor // per-layer cached projected encoder V [encLen, nTextState]
 	crossReady []bool      // whether crossK/crossV are initialized for layer
 	scratch    decoderScratch
+}
+
+type tokenLogProb struct {
+	token   int32
+	logprob float32
 }
 
 type decoderScratch struct {
@@ -318,12 +323,17 @@ type decoderScratch struct {
 	selfS  ml.Tensor // [nHead, 1, nTextCtx]
 	crossS ml.Tensor // [nHead, 1, encLen]
 	logits ml.Tensor // [1, nVocab]
+
+	topK   []tokenLogProb
+	idxTmp []int
+	sTmp   []float32
 }
 
 func (d *WhisperDecoder) newDecoderState(prompt []int32) *decoderState {
+	headDim := d.nTextState / d.nHead
 	state := &decoderState{
 		tokens:     make([]int32, len(prompt)),
-		kvCache:    ml.New(d.nTextLayer, 2, d.nTextCtx, d.nTextState),
+		kvCache:    ml.New(d.nTextLayer, 2, d.nHead, d.nTextCtx, headDim),
 		cachedPos:  0,
 		crossK:     make([]ml.Tensor, d.nTextLayer),
 		crossV:     make([]ml.Tensor, d.nTextLayer),
@@ -331,7 +341,6 @@ func (d *WhisperDecoder) newDecoderState(prompt []int32) *decoderState {
 	}
 	copy(state.tokens, prompt)
 
-	headDim := d.nTextState / d.nHead
 	state.scratch = decoderScratch{
 		x:      ml.New(1, d.nTextState),
 		xln:    ml.New(1, d.nTextState),
@@ -350,9 +359,31 @@ func (d *WhisperDecoder) newDecoderState(prompt []int32) *decoderState {
 	return state
 }
 
+func (d *WhisperDecoder) resetDecoderState(state *decoderState, tokens []int32) {
+	if cap(state.tokens) < len(tokens) {
+		state.tokens = make([]int32, len(tokens))
+	} else {
+		state.tokens = state.tokens[:len(tokens)]
+	}
+	copy(state.tokens, tokens)
+	for i := range state.kvCache.Data {
+		state.kvCache.Data[i] = 0
+	}
+	state.cachedPos = 0
+	for i := range state.crossReady {
+		state.crossReady[i] = false
+	}
+}
+
 func addBiasRowInPlace(dst, bias ml.Tensor) {
 	for i := range bias.Data {
 		dst.Data[i] += bias.Data[i]
+	}
+}
+
+func addBiasAndResidualInPlace(dst, add, bias ml.Tensor) {
+	for i := range dst.Data {
+		dst.Data[i] += add.Data[i] + bias.Data[i]
 	}
 }
 
@@ -400,10 +431,12 @@ func (d *WhisperDecoder) decodeGreedy(ctx context.Context, encoderOut ml.Tensor,
 		}
 
 		// Sample next token using greedy with temperature and fallback.
-		nextToken, err := d.sampleGreedy(logits, temperature, params)
+		nextToken, idxTmp, sTmp, err := d.sampleGreedyWithScratch(logits, temperature, params, state.scratch.idxTmp, state.scratch.sTmp)
 		if err != nil {
 			return nil, fmt.Errorf("model: decode: sample: %w", err)
 		}
+		state.scratch.idxTmp = idxTmp
+		state.scratch.sTmp = sTmp
 
 		state.tokens = append(state.tokens, nextToken)
 
@@ -424,12 +457,13 @@ func (d *WhisperDecoder) decodeBeamSearch(ctx context.Context, encoderOut ml.Ten
 		beamSize = 1
 	}
 
-	// Initialize beam hypotheses.
+	// Initialize beam hypotheses with reusable decoder state.
 	beams := make([]*beam, beamSize)
 	for i := 0; i < beamSize; i++ {
 		beams[i] = &beam{
 			tokens: make([]int32, len(params.Prompt)),
 			score:  0,
+			state:  d.newDecoderState(params.Prompt),
 		}
 		copy(beams[i].tokens, params.Prompt)
 	}
@@ -450,50 +484,54 @@ func (d *WhisperDecoder) decodeBeamSearch(ctx context.Context, encoderOut ml.Ten
 		maxTokens = 0
 	}
 
+	allCandidates := make([]beamCandidate, 0, beamSize*6)
+	reusableStates := make([]*decoderState, beamSize)
+
 	for step := 0; step < maxTokens; step++ {
 		if err := ctx.Err(); err != nil {
 			return nil, fmt.Errorf("model: decode: beam search cancelled: %w", err)
 		}
 
 		// Compute logits for all beam hypotheses.
-		allCandidates := []*beamCandidate{}
+		allCandidates = allCandidates[:0]
 
-		for _, hyp := range beams {
+		for bi, hyp := range beams {
+			reusableStates[bi] = hyp.state
 			if len(hyp.tokens) > 0 && hyp.tokens[len(hyp.tokens)-1] == d.eotToken {
 				// This hypothesis has reached EOT, keep it unchanged.
-				allCandidates = append(allCandidates, &beamCandidate{
-					hyp:     hyp,
-					token:   d.eotToken,
-					logprob: 0,
+				normScore := hyp.score / float32(math.Pow(float64(len(hyp.tokens)), 0.6))
+				allCandidates = append(allCandidates, beamCandidate{
+					tokens:    hyp.tokens,
+					score:     hyp.score,
+					token:     d.eotToken,
+					logprob:   0,
+					normScore: normScore,
 				})
 				continue
 			}
 
-			state := d.newDecoderState(nil)
-			state.tokens = hyp.tokens
-
-			logits, err := d.forward(ctx, state, encoderOut)
+			d.resetDecoderState(hyp.state, hyp.tokens)
+			logits, err := d.forward(ctx, hyp.state, encoderOut)
 			if err != nil {
 				return nil, fmt.Errorf("model: decode: beam search forward: %w", err)
 			}
 
 			// Get top-K candidates from this hypothesis.
 			topK := 5 // Heuristic: keep top 5 candidates per hypothesis.
-			candidates := d.topKTokens(logits, topK, temperature)
+			candidates, topBuf := d.topKTokensWithScratch(logits, topK, temperature, hyp.state.scratch.topK)
+			hyp.state.scratch.topK = topBuf
 
 			for _, candidate := range candidates {
-				newHyp := &beam{
-					tokens: make([]int32, len(hyp.tokens)+1),
-					score:  hyp.score + candidate.logprob,
-				}
-				copy(newHyp.tokens, hyp.tokens)
-				newHyp.tokens[len(hyp.tokens)] = candidate.token
+				newTokens := make([]int32, len(hyp.tokens)+1)
+				copy(newTokens, hyp.tokens)
+				newTokens[len(hyp.tokens)] = candidate.token
+				newScore := hyp.score + candidate.logprob
 
 				// Normalize score by sequence length (length penalty).
-				normScore := newHyp.score / float32(math.Pow(float64(len(newHyp.tokens)), 0.6))
-
-				allCandidates = append(allCandidates, &beamCandidate{
-					hyp:       newHyp,
+				normScore := newScore / float32(math.Pow(float64(len(newTokens)), 0.6))
+				allCandidates = append(allCandidates, beamCandidate{
+					tokens:    newTokens,
+					score:     newScore,
 					token:     candidate.token,
 					logprob:   candidate.logprob,
 					normScore: normScore,
@@ -505,10 +543,16 @@ func (d *WhisperDecoder) decodeBeamSearch(ctx context.Context, encoderOut ml.Ten
 		bestCandidates := sortAndPruneBeams(allCandidates, beamSize)
 
 		// Update beams with top candidates.
-		beams = make([]*beam, len(bestCandidates))
+		nextBeams := make([]*beam, len(bestCandidates))
 		for i, cand := range bestCandidates {
-			beams[i] = cand.hyp
+			state := reusableStates[i]
+			if state == nil {
+				state = d.newDecoderState(nil)
+			}
+			nextBeams[i] = &beam{tokens: cand.tokens, score: cand.score, state: state}
+			reusableStates[i] = nil
 		}
+		beams = nextBeams
 
 		// Check if all hypotheses have reached EOT.
 		allEOT := true
@@ -534,11 +578,13 @@ func (d *WhisperDecoder) decodeBeamSearch(ctx context.Context, encoderOut ml.Ten
 type beam struct {
 	tokens []int32
 	score  float32
+	state  *decoderState
 }
 
 // beamCandidate represents a candidate token for beam expansion.
 type beamCandidate struct {
-	hyp       *beam
+	tokens    []int32
+	score     float32
 	token     int32
 	logprob   float32
 	normScore float32
@@ -590,9 +636,7 @@ func (d *WhisperDecoder) forward(ctx context.Context, state *decoderState, encod
 		if err != nil {
 			return nil, fmt.Errorf("model: decode: block %d self_attn: %w", i, err)
 		}
-		if err := ml.AddInPlace(x, attnOut); err != nil {
-			return nil, fmt.Errorf("model: decode: block %d self_attn residual: %w", i, err)
-		}
+		addBiasAndResidualInPlace(x, attnOut, b.selfAttn.outB)
 
 		// Cross-attention to encoder output.
 		if err := ml.LayerNormInto(xln, x, b.cAttnLnW, b.cAttnLnB, layerNormEps); err != nil {
@@ -602,9 +646,7 @@ func (d *WhisperDecoder) forward(ctx context.Context, state *decoderState, encod
 		if err != nil {
 			return nil, fmt.Errorf("model: decode: block %d cross_attn: %w", i, err)
 		}
-		if err := ml.AddInPlace(x, crossOut); err != nil {
-			return nil, fmt.Errorf("model: decode: block %d cross_attn residual: %w", i, err)
-		}
+		addBiasAndResidualInPlace(x, crossOut, b.crossAttn.outB)
 
 		// MLP sub-layer.
 		if err := ml.LayerNormInto(xln, x, b.mlpLnW, b.mlpLnB, layerNormEps); err != nil {
@@ -614,9 +656,7 @@ func (d *WhisperDecoder) forward(ctx context.Context, state *decoderState, encod
 		if err != nil {
 			return nil, fmt.Errorf("model: decode: block %d mlp: %w", i, err)
 		}
-		if err := ml.AddInPlace(x, mlpOut); err != nil {
-			return nil, fmt.Errorf("model: decode: block %d mlp residual: %w", i, err)
-		}
+		addBiasAndResidualInPlace(x, mlpOut, b.mlp2B)
 
 		if err := ctx.Err(); err != nil {
 			return nil, fmt.Errorf("model: decode: cancelled after block %d: %w", i, err)
@@ -667,14 +707,17 @@ func (d *WhisperDecoder) runDecoderSelfAttn(ctx context.Context, state *decoderS
 	addBiasRowInPlace(sc.v, attn.vB)
 
 	// Update KV cache with new K and V.
-	// kvCache shape: [nLayer, 2, nTextCtx, nTextState]
-	// Store k and v at position pos.
+	// kvCache shape: [nLayer, 2, nHead, nTextCtx, headDim]
 	nTextCtx := d.nTextCtx
-	nTextState := d.nTextState
-	kCacheOff := layerIdx*2*nTextCtx*nTextState + 0*nTextCtx*nTextState + pos*nTextState
-	vCacheOff := layerIdx*2*nTextCtx*nTextState + 1*nTextCtx*nTextState + pos*nTextState
-	copy(kvCache.Data[kCacheOff:kCacheOff+nTextState], sc.k.Data)
-	copy(kvCache.Data[vCacheOff:vCacheOff+nTextState], sc.v.Data)
+	headBlock := nTextCtx * headDim
+	base := layerIdx * 2 * d.nHead * headBlock
+	for h := 0; h < d.nHead; h++ {
+		src := h * headDim
+		kOff := base + h*headBlock + pos*headDim
+		vOff := base + d.nHead*headBlock + h*headBlock + pos*headDim
+		copy(kvCache.Data[kOff:kOff+headDim], sc.k.Data[src:src+headDim])
+		copy(kvCache.Data[vOff:vOff+headDim], sc.v.Data[src:src+headDim])
+	}
 
 	// Retrieve accumulated K and V up to pos+1.
 	// We need [nHead, pos+1, headDim] for both.
@@ -682,19 +725,16 @@ func (d *WhisperDecoder) runDecoderSelfAttn(ctx context.Context, state *decoderS
 	kFull := ml.From(sc.kFull.Data[:d.nHead*seqLen*headDim], d.nHead, seqLen, headDim)
 	vFull := ml.From(sc.vFull.Data[:d.nHead*seqLen*headDim], d.nHead, seqLen, headDim)
 
-	kLayerOff := layerIdx * 2 * nTextCtx * nTextState
-	vLayerOff := layerIdx*2*nTextCtx*nTextState + 1*nTextCtx*nTextState
-
+	kBase := layerIdx * 2 * d.nHead * headBlock
+	vBase := kBase + d.nHead*headBlock
 	for h := 0; h < d.nHead; h++ {
-		for s := 0; s < seqLen; s++ {
-			srcKOff := kLayerOff + s*nTextState + h*headDim
-			dstKOff := h*seqLen*headDim + s*headDim
-			copy(kFull.Data[dstKOff:dstKOff+headDim], kvCache.Data[srcKOff:srcKOff+headDim])
+		srcK := kBase + h*headBlock
+		dstK := h * seqLen * headDim
+		copy(kFull.Data[dstK:dstK+seqLen*headDim], kvCache.Data[srcK:srcK+seqLen*headDim])
 
-			srcVOff := vLayerOff + s*nTextState + h*headDim
-			dstVOff := h*seqLen*headDim + s*headDim
-			copy(vFull.Data[dstVOff:dstVOff+headDim], kvCache.Data[srcVOff:srcVOff+headDim])
-		}
+		srcV := vBase + h*headBlock
+		dstV := h * seqLen * headDim
+		copy(vFull.Data[dstV:dstV+seqLen*headDim], kvCache.Data[srcV:srcV+seqLen*headDim])
 	}
 
 	// Reshape Q for attention: [nHead, 1, headDim]
@@ -712,7 +752,6 @@ func (d *WhisperDecoder) runDecoderSelfAttn(ctx context.Context, state *decoderS
 	if err := ml.MatMulTransBInto(ctx, attnOut, attn.outW, sc.out); err != nil {
 		return ml.Tensor{}, fmt.Errorf("model: decode: self_attn: out matmul: %w", err)
 	}
-	addBiasRowInPlace(sc.out, attn.outB)
 
 	return sc.out, nil
 }
@@ -776,7 +815,6 @@ func (d *WhisperDecoder) runDecoderCrossAttn(ctx context.Context, state *decoder
 	if err := ml.MatMulTransBInto(ctx, attnOut, attn.outW, sc.out); err != nil {
 		return ml.Tensor{}, fmt.Errorf("model: decode: cross_attn: out matmul: %w", err)
 	}
-	addBiasRowInPlace(sc.out, attn.outB)
 
 	return sc.out, nil
 }
@@ -799,15 +837,14 @@ func (d *WhisperDecoder) runMLP(ctx context.Context, state *decoderState, x ml.T
 	if err := ml.MatMulTransBInto(ctx, sc.mlpH, b.mlp2W, sc.out); err != nil {
 		return ml.Tensor{}, fmt.Errorf("model: decode: mlp.2: %w", err)
 	}
-	addBiasRowInPlace(sc.out, b.mlp2B)
 
 	return sc.out, nil
 }
 
 // sampleGreedy samples the next token using greedy sampling with temperature and fallback.
-func (d *WhisperDecoder) sampleGreedy(logits []float32, temperature float32, params DecoderParams) (int32, error) {
+func (d *WhisperDecoder) sampleGreedyWithScratch(logits []float32, temperature float32, params DecoderParams, idxScratch []int, scaledScratch []float32) (int32, []int, []float32, error) {
 	if len(logits) != d.nVocab {
-		return 0, fmt.Errorf("model: decode: sample: logits length mismatch")
+		return 0, idxScratch, scaledScratch, fmt.Errorf("model: decode: sample: logits length mismatch")
 	}
 
 	invTemp := float32(1.0)
@@ -862,20 +899,24 @@ func (d *WhisperDecoder) sampleGreedy(logits []float32, temperature float32, par
 		logZ := float32(math.Log(float64(expSum))) + scaledMax
 		maxLogProb := logits[maxIdx]*invTemp - logZ
 		if maxLogProb < -logprobThold {
-			return d.sampleTopPFromLogits(logits, temperature, 0.9), nil
+			tok, idxScratch, scaledScratch := d.sampleTopPFromLogitsWithScratch(logits, temperature, 0.9, idxScratch, scaledScratch)
+			return tok, idxScratch, scaledScratch, nil
 		}
 	}
 
-	return int32(maxIdx), nil
+	return int32(maxIdx), idxScratch, scaledScratch, nil
+}
+
+// sampleGreedy samples the next token using greedy sampling with temperature and fallback.
+func (d *WhisperDecoder) sampleGreedy(logits []float32, temperature float32, params DecoderParams) (int32, error) {
+	tok, _, _, err := d.sampleGreedyWithScratch(logits, temperature, params, nil, nil)
+	return tok, err
 }
 
 // topKTokens returns the top-K tokens by probability.
-func (d *WhisperDecoder) topKTokens(logits []float32, k int, temperature float32) []struct {
-	token   int32
-	logprob float32
-} {
+func (d *WhisperDecoder) topKTokensWithScratch(logits []float32, k int, temperature float32, top []tokenLogProb) ([]tokenLogProb, []tokenLogProb) {
 	if len(logits) != d.nVocab || k <= 0 {
-		return nil
+		return nil, top
 	}
 	if k > len(logits) {
 		k = len(logits)
@@ -890,7 +931,7 @@ func (d *WhisperDecoder) topKTokens(logits []float32, k int, temperature float32
 		token int32
 		score float32
 	}
-	top := make([]tokenScore, 0, k)
+	work := make([]tokenScore, 0, k)
 	minPos := -1
 	minVal := float32(0)
 
@@ -901,10 +942,10 @@ func (d *WhisperDecoder) topKTokens(logits []float32, k int, temperature float32
 			scaledMax = s
 		}
 
-		if len(top) < k {
-			top = append(top, tokenScore{token: int32(i), score: s})
+		if len(work) < k {
+			work = append(work, tokenScore{token: int32(i), score: s})
 			if minPos < 0 || s < minVal {
-				minPos = len(top) - 1
+				minPos = len(work) - 1
 				minVal = s
 			}
 			continue
@@ -914,12 +955,12 @@ func (d *WhisperDecoder) topKTokens(logits []float32, k int, temperature float32
 			continue
 		}
 
-		top[minPos] = tokenScore{token: int32(i), score: s}
+		work[minPos] = tokenScore{token: int32(i), score: s}
 		minPos = 0
-		minVal = top[0].score
-		for j := 1; j < len(top); j++ {
-			if top[j].score < minVal {
-				minVal = top[j].score
+		minVal = work[0].score
+		for j := 1; j < len(work); j++ {
+			if work[j].score < minVal {
+				minVal = work[j].score
 				minPos = j
 			}
 		}
@@ -931,19 +972,37 @@ func (d *WhisperDecoder) topKTokens(logits []float32, k int, temperature float32
 	}
 	logZ := float32(math.Log(float64(expSum))) + scaledMax
 
+	if cap(top) < len(work) {
+		top = make([]tokenLogProb, len(work))
+	} else {
+		top = top[:len(work)]
+	}
+	for i, tp := range work {
+		top[i].token = tp.token
+		top[i].logprob = tp.score - logZ
+	}
+
+	sort.Slice(top, func(i, j int) bool {
+		return top[i].logprob > top[j].logprob
+	})
+
+	return top, top
+}
+
+// topKTokens returns the top-K tokens by probability.
+func (d *WhisperDecoder) topKTokens(logits []float32, k int, temperature float32) []struct {
+	token   int32
+	logprob float32
+} {
+	top, _ := d.topKTokensWithScratch(logits, k, temperature, nil)
 	result := make([]struct {
 		token   int32
 		logprob float32
 	}, len(top))
-	for i, tp := range top {
-		result[i].token = tp.token
-		result[i].logprob = tp.score - logZ
+	for i := range top {
+		result[i].token = top[i].token
+		result[i].logprob = top[i].logprob
 	}
-
-	sort.Slice(result, func(i, j int) bool {
-		return result[i].logprob > result[j].logprob
-	})
-
 	return result
 }
 
@@ -987,14 +1046,48 @@ func (d *WhisperDecoder) sampleTopPFromLogitsWithScratch(logits []float32, tempe
 	}
 	logZ := float32(math.Log(float64(expSum))) + scaledMax
 
-	sort.Slice(idxScratch, func(i, j int) bool {
-		return scaledScratch[idxScratch[i]] > scaledScratch[idxScratch[j]]
+	const nucleusFastLimit = 512
+	limit := nucleusFastLimit
+	if limit > n {
+		limit = n
+	}
+
+	selected := idxScratch[:0]
+	minPos := -1
+	minScore := float32(0)
+	for i := 0; i < n; i++ {
+		if len(selected) < limit {
+			selected = append(selected, i)
+			s := scaledScratch[i]
+			if minPos < 0 || s < minScore {
+				minPos = len(selected) - 1
+				minScore = s
+			}
+			continue
+		}
+		s := scaledScratch[i]
+		if s > minScore {
+			selected[minPos] = i
+			minPos = 0
+			minScore = scaledScratch[selected[0]]
+			for j := 1; j < len(selected); j++ {
+				sj := scaledScratch[selected[j]]
+				if sj < minScore {
+					minScore = sj
+					minPos = j
+				}
+			}
+		}
+	}
+
+	sort.Slice(selected, func(i, j int) bool {
+		return scaledScratch[selected[i]] > scaledScratch[selected[j]]
 	})
 
 	topCount := 0
 	var cumSum float32
-	for i := 0; i < len(idxScratch); i++ {
-		s := scaledScratch[idxScratch[i]]
+	for i := 0; i < len(selected); i++ {
+		s := scaledScratch[selected[i]]
 		p := float32(math.Exp(float64(s - logZ)))
 		cumSum += p
 		topCount = i + 1
@@ -1003,14 +1096,36 @@ func (d *WhisperDecoder) sampleTopPFromLogitsWithScratch(logits []float32, tempe
 		}
 	}
 
+	// Fallback to full sort only when the limited candidate set cannot hit top-p.
+	if cumSum < topP && len(selected) < n {
+		for i := 0; i < n; i++ {
+			idxScratch[i] = i
+		}
+		sort.Slice(idxScratch, func(i, j int) bool {
+			return scaledScratch[idxScratch[i]] > scaledScratch[idxScratch[j]]
+		})
+		selected = idxScratch
+		topCount = 0
+		cumSum = 0
+		for i := 0; i < len(selected); i++ {
+			s := scaledScratch[selected[i]]
+			p := float32(math.Exp(float64(s - logZ)))
+			cumSum += p
+			topCount = i + 1
+			if cumSum >= topP {
+				break
+			}
+		}
+	}
+
 	if topCount == 0 {
-		return int32(idxScratch[0]), idxScratch, scaledScratch
+		return int32(selected[0]), idxScratch, scaledScratch
 	}
 
 	r := rand.Float32() * cumSum
 	var run float32
 	for i := 0; i < topCount; i++ {
-		idx := idxScratch[i]
+		idx := selected[i]
 		s := scaledScratch[idx]
 		p := float32(math.Exp(float64(s - logZ)))
 		run += p
@@ -1019,7 +1134,7 @@ func (d *WhisperDecoder) sampleTopPFromLogitsWithScratch(logits []float32, tempe
 		}
 	}
 
-	return int32(idxScratch[topCount-1]), idxScratch, scaledScratch
+	return int32(selected[topCount-1]), idxScratch, scaledScratch
 }
 
 // sampleTopPFromLogits performs top-p (nucleus) sampling from logits.
@@ -1081,9 +1196,9 @@ func (d *WhisperDecoder) tokensToSegments(tokens []int32, prompt []int32) ([]Seg
 }
 
 // sortAndPruneBeams sorts beam candidates by normalized score and returns top-K.
-func sortAndPruneBeams(candidates []*beamCandidate, k int) []*beamCandidate {
+func sortAndPruneBeams(candidates []beamCandidate, k int) []beamCandidate {
 	if len(candidates) == 0 {
-		return []*beamCandidate{}
+		return []beamCandidate{}
 	}
 
 	sort.Slice(candidates, func(i, j int) bool {

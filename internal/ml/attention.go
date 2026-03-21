@@ -96,6 +96,101 @@ func ScaledDotProductAttentionInto(ctx context.Context, q, k, v Tensor, causal b
 	}
 
 	scale := float32(1.0 / math.Sqrt(float64(headDim)))
+	negInf := float32(math.Inf(-1))
+
+	processHeadRange := func(start, end int) error {
+		for h := start; h < end; h++ {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+
+			qOff := h * Tq * headDim
+			kOff := h * Tk * headDim
+			vOff := h * Tk * headDim
+
+			scoresOff := h * Tq * Tk
+			scores := scoresScratch.Data[scoresOff : scoresOff+Tq*Tk]
+
+			// Q: [Tq, headDim], K: [Tk, headDim] -> scores: [Tq, Tk]
+			qTensor := Tensor{Shape: []int{Tq, headDim}, Data: q.Data[qOff : qOff+Tq*headDim]}
+			kTensor := Tensor{Shape: []int{Tk, headDim}, Data: k.Data[kOff : kOff+Tk*headDim]}
+			scoresTensor := Tensor{Shape: []int{Tq, Tk}, Data: scores}
+			err := MatMulTransBInto(ctx, qTensor, kTensor, scoresTensor)
+			if err != nil {
+				return err
+			}
+
+			for i := range scores {
+				scores[i] *= scale
+			}
+
+			if causal {
+				for i := 0; i < Tq; i++ {
+					for j := i + 1; j < Tk; j++ {
+						scores[i*Tk+j] = negInf
+					}
+				}
+			}
+
+			for i := 0; i < Tq; i++ {
+				row := scores[i*Tk : (i+1)*Tk]
+				maxVal := row[0]
+				for _, val := range row[1:] {
+					if val > maxVal {
+						maxVal = val
+					}
+				}
+
+				var sum float32
+				if attentionUseFastExp {
+					for j := range row {
+						row[j] = fastExpApprox(row[j] - maxVal)
+						sum += row[j]
+					}
+				} else {
+					for j := range row {
+						row[j] = float32(math.Exp(float64(row[j] - maxVal)))
+						sum += row[j]
+					}
+				}
+
+				if sum == 0 {
+					inv := 1.0 / float32(len(row))
+					for j := range row {
+						row[j] = inv
+					}
+					continue
+				}
+				invSum := 1 / sum
+				for j := range row {
+					row[j] *= invSum
+				}
+			}
+
+			if returnWeights {
+				copy(weights.Data[scoresOff:scoresOff+Tq*Tk], scores)
+			}
+
+			outScoresTensor := Tensor{Shape: []int{Tq, Tk}, Data: scores}
+			vTensor := Tensor{Shape: []int{Tk, headDim}, Data: v.Data[vOff : vOff+Tk*headDim]}
+			outOff := h * Tq * headDim
+			headOut := Tensor{Shape: []int{Tq, headDim}, Data: out.Data[outOff : outOff+Tq*headDim]}
+			err = MatMulInto(ctx, outScoresTensor, vTensor, headOut)
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	// Token-wise decoder attention typically has Tq=1 and small head counts.
+	// Avoid goroutine/errgroup overhead in this hot path.
+	if Tq == 1 || heads <= 4 {
+		if err := processHeadRange(0, heads); err != nil {
+			return fmt.Errorf("ml: attention: %w", err)
+		}
+		return nil
+	}
 
 	numCPU := runtime.NumCPU()
 	g, gctx := errgroup.WithContext(ctx)
@@ -104,96 +199,16 @@ func ScaledDotProductAttentionInto(ctx context.Context, q, k, v Tensor, causal b
 		chunkSize = 1
 	}
 
-	negInf := float32(math.Inf(-1))
-
 	for start := 0; start < heads; start += chunkSize {
 		start, end := start, start+chunkSize
 		if end > heads {
 			end = heads
 		}
 		g.Go(func() error {
-			for h := start; h < end; h++ {
-				if err := gctx.Err(); err != nil {
-					return err
-				}
-
-				qOff := h * Tq * headDim
-				kOff := h * Tk * headDim
-				vOff := h * Tk * headDim
-
-				scoresOff := h * Tq * Tk
-				scores := scoresScratch.Data[scoresOff : scoresOff+Tq*Tk]
-
-				// Q: [Tq, headDim], K: [Tk, headDim] -> scores: [Tq, Tk]
-				qTensor := Tensor{Shape: []int{Tq, headDim}, Data: q.Data[qOff : qOff+Tq*headDim]}
-				kTensor := Tensor{Shape: []int{Tk, headDim}, Data: k.Data[kOff : kOff+Tk*headDim]}
-				scoresTensor := Tensor{Shape: []int{Tq, Tk}, Data: scores}
-				err := MatMulTransBInto(gctx, qTensor, kTensor, scoresTensor)
-				if err != nil {
-					return err
-				}
-
-				for i := range scores {
-					scores[i] *= scale
-				}
-
-				if causal {
-					for i := 0; i < Tq; i++ {
-						for j := i + 1; j < Tk; j++ {
-							scores[i*Tk+j] = negInf
-						}
-					}
-				}
-
-				for i := 0; i < Tq; i++ {
-					row := scores[i*Tk : (i+1)*Tk]
-					maxVal := row[0]
-					for _, val := range row[1:] {
-						if val > maxVal {
-							maxVal = val
-						}
-					}
-
-					var sum float32
-					if attentionUseFastExp {
-						for j := range row {
-							row[j] = fastExpApprox(row[j] - maxVal)
-							sum += row[j]
-						}
-					} else {
-						for j := range row {
-							row[j] = float32(math.Exp(float64(row[j] - maxVal)))
-							sum += row[j]
-						}
-					}
-
-					if sum == 0 {
-						inv := 1.0 / float32(len(row))
-						for j := range row {
-							row[j] = inv
-						}
-						continue
-					}
-					invSum := 1 / sum
-					for j := range row {
-						row[j] *= invSum
-					}
-				}
-
-				if returnWeights {
-					copy(weights.Data[scoresOff:scoresOff+Tq*Tk], scores)
-				}
-
-				outScoresTensor := Tensor{Shape: []int{Tq, Tk}, Data: scores}
-				vTensor := Tensor{Shape: []int{Tk, headDim}, Data: v.Data[vOff : vOff+Tk*headDim]}
-				outOff := h * Tq * headDim
-				headOut := Tensor{Shape: []int{Tq, headDim}, Data: out.Data[outOff : outOff+Tq*headDim]}
-				err = MatMulInto(gctx, outScoresTensor, vTensor, headOut)
-				if err != nil {
-					return err
-				}
+			if err := gctx.Err(); err != nil {
+				return err
 			}
-			return nil
+			return processHeadRange(start, end)
 		})
 	}
 
