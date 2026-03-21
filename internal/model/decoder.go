@@ -927,11 +927,11 @@ func (d *WhisperDecoder) topKTokensWithScratch(logits []float32, k int, temperat
 		invTemp = 1 / temperature
 	}
 
-	type tokenScore struct {
-		token int32
-		score float32
+	if cap(top) < k {
+		top = make([]tokenLogProb, 0, k)
+	} else {
+		top = top[:0]
 	}
-	work := make([]tokenScore, 0, k)
 	minPos := -1
 	minVal := float32(0)
 
@@ -942,10 +942,10 @@ func (d *WhisperDecoder) topKTokensWithScratch(logits []float32, k int, temperat
 			scaledMax = s
 		}
 
-		if len(work) < k {
-			work = append(work, tokenScore{token: int32(i), score: s})
+		if len(top) < k {
+			top = append(top, tokenLogProb{token: int32(i), logprob: s})
 			if minPos < 0 || s < minVal {
-				minPos = len(work) - 1
+				minPos = len(top) - 1
 				minVal = s
 			}
 			continue
@@ -955,12 +955,12 @@ func (d *WhisperDecoder) topKTokensWithScratch(logits []float32, k int, temperat
 			continue
 		}
 
-		work[minPos] = tokenScore{token: int32(i), score: s}
+		top[minPos] = tokenLogProb{token: int32(i), logprob: s}
 		minPos = 0
-		minVal = work[0].score
-		for j := 1; j < len(work); j++ {
-			if work[j].score < minVal {
-				minVal = work[j].score
+		minVal = top[0].logprob
+		for j := 1; j < len(top); j++ {
+			if top[j].logprob < minVal {
+				minVal = top[j].logprob
 				minPos = j
 			}
 		}
@@ -972,14 +972,8 @@ func (d *WhisperDecoder) topKTokensWithScratch(logits []float32, k int, temperat
 	}
 	logZ := float32(math.Log(float64(expSum))) + scaledMax
 
-	if cap(top) < len(work) {
-		top = make([]tokenLogProb, len(work))
-	} else {
-		top = top[:len(work)]
-	}
-	for i, tp := range work {
-		top[i].token = tp.token
-		top[i].logprob = tp.score - logZ
+	for i := range top {
+		top[i].logprob -= logZ
 	}
 
 	sort.Slice(top, func(i, j int) bool {

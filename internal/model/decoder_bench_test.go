@@ -123,6 +123,21 @@ func BenchmarkDecoderSamplingOnly(b *testing.B) {
 		}
 	})
 
+	b.Run("top_k_tokens_reuse_scratch", func(b *testing.B) {
+		const k = 5
+		topScratch := make([]tokenLogProb, 0, k)
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			var candidates []tokenLogProb
+			candidates, topScratch = decoder.topKTokensWithScratch(logits, k, 1.0, topScratch)
+			if len(candidates) != k {
+				b.Fatalf("topKTokensWithScratch size mismatch: got %d want %d", len(candidates), k)
+			}
+			benchmarkTopKCountSink += len(candidates)
+		}
+	})
+
 	b.Run("top_p_from_logits", func(b *testing.B) {
 		const topP = 0.9
 		b.ReportAllocs()
@@ -227,6 +242,21 @@ func BenchmarkDecoderSamplingByVocab(b *testing.B) {
 				}
 			})
 
+			b.Run("top_k_5_reuse_scratch", func(b *testing.B) {
+				const k = 5
+				topScratch := make([]tokenLogProb, 0, k)
+				b.ReportAllocs()
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					var cands []tokenLogProb
+					cands, topScratch = decoder.topKTokensWithScratch(logits, k, 1.0, topScratch)
+					if len(cands) != k {
+						b.Fatalf("topKTokensWithScratch size mismatch: got %d want %d", len(cands), k)
+					}
+					benchmarkTopKCountSink += len(cands)
+				}
+			})
+
 			b.Run("top_p_logits_reuse_scratch", func(b *testing.B) {
 				const topP = 0.9
 				idxScratch := make([]int, 0, len(logits))
@@ -239,6 +269,39 @@ func BenchmarkDecoderSamplingByVocab(b *testing.B) {
 					benchmarkSampleTokenSink = tok
 				}
 			})
+		})
+	}
+}
+
+func BenchmarkDecoderBeamSearchLatency(b *testing.B) {
+	ctx := context.Background()
+	decoder := buildTestDecoder()
+
+	encLen := 64
+	encoderOut := ml.New(encLen, testNTextState)
+	for i := range encoderOut.Data {
+		encoderOut.Data[i] = 0.01
+	}
+
+	for _, beamSize := range []int{2, 4} {
+		beamSize := beamSize
+		b.Run(fmt.Sprintf("beam_%d", beamSize), func(b *testing.B) {
+			params := DecoderParams{
+				Prompt:      []int32{50258, 50259, 50357, 50363},
+				BeamSize:    beamSize,
+				MaxTokens:   16,
+				Temperature: 1.0,
+			}
+
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				segments, err := decoder.decodeBeamSearch(ctx, encoderOut, params)
+				if err != nil {
+					b.Fatalf("decodeBeamSearch failed: %v", err)
+				}
+				benchmarkTopKCountSink += len(segments)
+			}
 		})
 	}
 }
