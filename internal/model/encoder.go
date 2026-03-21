@@ -56,33 +56,60 @@ func loadTensor(ctx context.Context, f *gguf.File, name string) (ml.Tensor, erro
 func NewEncoder(f *gguf.File) (*WhisperEncoder, error) {
 	ctx := context.Background()
 
-	getMeta := func(key string) (uint32, error) {
-		v, ok := f.MetaUint32(key)
-		if !ok {
-			return 0, fmt.Errorf("model: encoder: missing metadata %q", key)
+	nHead, _ := getMetaAny(f, "whisper.encoder.attention.head_count")
+	nLayers, _ := getMetaAny(f, "whisper.encoder.layer_count")
+	nAudioCtx, _ := getMetaAny(f, "whisper.encoder.context_length")
+	nAudioState, _ := getMetaAny(f, "whisper.encoder.embedding_length")
+	nMels, _ := getMetaAny(f, "whisper.audio.mel_count", "whisper.n_mels")
+
+	if nLayers == 0 {
+		if c, ok := inferLayerCount(f, "encoder.blocks.%d.attn.query.weight"); ok {
+			nLayers = uint32(c)
 		}
-		return v, nil
 	}
 
-	nHead, err := getMeta("whisper.encoder.attention.head_count")
-	if err != nil {
-		return nil, err
+	if nAudioState == 0 {
+		b, _, err := loadTensorAuto(ctx, f, "encoder.conv1.bias")
+		if err != nil {
+			return nil, err
+		}
+		if len(b.Shape) != 1 || b.Shape[0] <= 0 {
+			return nil, fmt.Errorf("model: encoder: invalid conv1.bias shape %v", b.Shape)
+		}
+		nAudioState = uint32(b.Shape[0])
 	}
-	nLayers, err := getMeta("whisper.encoder.layer_count")
-	if err != nil {
-		return nil, err
+
+	if attnShape, err := loadTensorShape(ctx, f, "encoder.blocks.0.attn.query.weight"); err == nil {
+		if len(attnShape) == 2 && attnShape[0] == attnShape[1] && attnShape[0] > 0 {
+			nAudioState = uint32(attnShape[0])
+		}
 	}
-	nAudioCtx, err := getMeta("whisper.encoder.context_length")
-	if err != nil {
-		return nil, err
+
+	if nAudioCtx == 0 {
+		posShape, err := loadTensorShape(ctx, f, "encoder.positional_embedding")
+		if err != nil {
+			return nil, err
+		}
+		if len(posShape) != 2 {
+			return nil, fmt.Errorf("model: encoder: invalid positional embedding shape %v", posShape)
+		}
+		if nAudioState > 0 {
+			if posShape[0] == int(nAudioState) && posShape[1] != int(nAudioState) {
+				nAudioCtx = uint32(posShape[1])
+			} else {
+				nAudioCtx = uint32(posShape[0])
+			}
+		} else {
+			nAudioCtx = uint32(posShape[0])
+			nAudioState = uint32(posShape[1])
+		}
 	}
-	nAudioState, err := getMeta("whisper.encoder.embedding_length")
-	if err != nil {
-		return nil, err
-	}
-	nMels, err := getMeta("whisper.audio.mel_count")
-	if err != nil {
-		return nil, err
+
+	if nHead == 0 {
+		if nAudioState%whisperHeadDim != 0 {
+			return nil, fmt.Errorf("model: encoder: cannot infer head count from embedding length %d", nAudioState)
+		}
+		nHead = nAudioState / whisperHeadDim
 	}
 
 	e := &WhisperEncoder{
@@ -95,29 +122,69 @@ func NewEncoder(f *gguf.File) (*WhisperEncoder, error) {
 	}
 
 	// Load conv stem weights.
-	// GGUF stores conv1.weight as [nMels, nAudioState, 3]; Conv1D expects [outC, inC, kernel].
-	t, err := loadTensor(ctx, f, "encoder.conv1.weight")
+	// Legacy whisper.cpp GGUF stores conv1 as [nMels, nAudioState, 3],
+	// while HuggingFace-style exports often store [nAudioState, nMels, 3].
+	t, resolvedName, err := loadTensorAuto(ctx, f, "encoder.conv1.weight")
 	if err != nil {
 		return nil, err
 	}
-	e.conv1W = ml.Transpose(t, 1, 0, 2)
+	if len(t.Shape) != 3 {
+		return nil, fmt.Errorf("model: encoder: invalid conv1.weight shape %v", t.Shape)
+	}
+	if t.Shape[0] == int(nAudioState) && t.Shape[1] > 0 && t.Shape[2] == 3 {
+		e.conv1W = t
+		if nMels == 0 {
+			nMels = uint32(t.Shape[1])
+			e.nMels = int(nMels)
+		}
+	} else if t.Shape[1] == int(nAudioState) && t.Shape[0] > 0 && t.Shape[2] == 3 {
+		e.conv1W = ml.Transpose(t, 1, 0, 2)
+		if nMels == 0 {
+			nMels = uint32(t.Shape[0])
+			e.nMels = int(nMels)
+		}
+	} else if t.Shape[0] == 3 && t.Shape[2] == int(nAudioState) && t.Shape[1] > 0 {
+		e.conv1W = ml.Transpose(t, 2, 1, 0)
+		if nMels == 0 {
+			nMels = uint32(t.Shape[1])
+			e.nMels = int(nMels)
+		}
+	} else {
+		return nil, fmt.Errorf("model: encoder: unsupported conv1.weight shape %v (from %q)", t.Shape, resolvedName)
+	}
 
-	if e.conv1B, err = loadTensor(ctx, f, "encoder.conv1.bias"); err != nil {
+	if e.conv1B, _, err = loadTensorAuto(ctx, f, "encoder.conv1.bias"); err != nil {
 		return nil, err
 	}
 
-	t, err = loadTensor(ctx, f, "encoder.conv2.weight")
+	t, _, err = loadTensorAuto(ctx, f, "encoder.conv2.weight")
 	if err != nil {
 		return nil, err
 	}
-	e.conv2W = ml.Transpose(t, 1, 0, 2)
+	if len(t.Shape) != 3 {
+		return nil, fmt.Errorf("model: encoder: invalid conv2.weight shape %v", t.Shape)
+	}
+	// conv2 in/out channels are both nAudioState in Whisper.
+	if t.Shape[0] == int(nAudioState) && t.Shape[1] == int(nAudioState) && t.Shape[2] == 3 {
+		e.conv2W = t
+	} else if t.Shape[0] == 3 && t.Shape[1] == int(nAudioState) && t.Shape[2] == int(nAudioState) {
+		e.conv2W = ml.Transpose(t, 2, 1, 0)
+	} else {
+		e.conv2W = ml.Transpose(t, 1, 0, 2)
+	}
 
-	if e.conv2B, err = loadTensor(ctx, f, "encoder.conv2.bias"); err != nil {
+	if e.conv2B, _, err = loadTensorAuto(ctx, f, "encoder.conv2.bias"); err != nil {
 		return nil, err
 	}
 
-	if e.posEmb, err = loadTensor(ctx, f, "encoder.positional_embedding"); err != nil {
+	if e.posEmb, _, err = loadTensorAuto(ctx, f, "encoder.positional_embedding"); err != nil {
 		return nil, err
+	}
+	if len(e.posEmb.Shape) != 2 {
+		return nil, fmt.Errorf("model: encoder: invalid positional embedding shape %v", e.posEmb.Shape)
+	}
+	if e.posEmb.Shape[0] == e.nAudioState && e.posEmb.Shape[1] == e.nAudioCtx {
+		e.posEmb = ml.Transpose(e.posEmb, 1, 0)
 	}
 
 	// Load transformer blocks.
@@ -125,66 +192,84 @@ func NewEncoder(f *gguf.File) (*WhisperEncoder, error) {
 		b := &e.blocks[i]
 		p := fmt.Sprintf("encoder.blocks.%d", i)
 
-		if b.attnLnW, err = loadTensor(ctx, f, p+".attn_ln.weight"); err != nil {
+		if b.attnLnW, _, err = loadTensorAuto(ctx, f, p+".attn_ln.weight"); err != nil {
 			return nil, err
 		}
-		if b.attnLnB, err = loadTensor(ctx, f, p+".attn_ln.bias"); err != nil {
+		if b.attnLnB, _, err = loadTensorAuto(ctx, f, p+".attn_ln.bias"); err != nil {
 			return nil, err
 		}
 		// Attention weights are [nAudioState, nAudioState] — used directly with MatMulTransB.
-		if b.attn.qW, err = loadTensor(ctx, f, p+".attn.query.weight"); err != nil {
+		if b.attn.qW, _, err = loadTensorAuto(ctx, f, p+".attn.query.weight"); err != nil {
 			return nil, err
 		}
-		if b.attn.qB, err = loadTensor(ctx, f, p+".attn.query.bias"); err != nil {
+		if b.attn.qB, _, err = loadTensorAuto(ctx, f, p+".attn.query.bias"); err != nil {
 			return nil, err
 		}
-		if b.attn.kW, err = loadTensor(ctx, f, p+".attn.key.weight"); err != nil {
+		if b.attn.kW, _, err = loadTensorAuto(ctx, f, p+".attn.key.weight"); err != nil {
 			return nil, err
 		}
-		if b.attn.vW, err = loadTensor(ctx, f, p+".attn.value.weight"); err != nil {
+		if b.attn.vW, _, err = loadTensorAuto(ctx, f, p+".attn.value.weight"); err != nil {
 			return nil, err
 		}
-		if b.attn.vB, err = loadTensor(ctx, f, p+".attn.value.bias"); err != nil {
+		if b.attn.vB, _, err = loadTensorAuto(ctx, f, p+".attn.value.bias"); err != nil {
 			return nil, err
 		}
-		if b.attn.outW, err = loadTensor(ctx, f, p+".attn.out.weight"); err != nil {
+		if b.attn.outW, _, err = loadTensorAuto(ctx, f, p+".attn.out.weight"); err != nil {
 			return nil, err
 		}
-		if b.attn.outB, err = loadTensor(ctx, f, p+".attn.out.bias"); err != nil {
+		if b.attn.outB, _, err = loadTensorAuto(ctx, f, p+".attn.out.bias"); err != nil {
 			return nil, err
 		}
-		if b.mlpLnW, err = loadTensor(ctx, f, p+".mlp_ln.weight"); err != nil {
+		if b.mlpLnW, _, err = loadTensorAuto(ctx, f, p+".mlp_ln.weight"); err != nil {
 			return nil, err
 		}
-		if b.mlpLnB, err = loadTensor(ctx, f, p+".mlp_ln.bias"); err != nil {
+		if b.mlpLnB, _, err = loadTensorAuto(ctx, f, p+".mlp_ln.bias"); err != nil {
 			return nil, err
 		}
-		// GGUF mlp.0.weight is [nAudioState, 4*nAudioState]; MatMulTransB needs [4D, D].
-		t, err = loadTensor(ctx, f, p+".mlp.0.weight")
+		// Desired layout for MatMulTransB is [4D, D].
+		t, _, err = loadTensorAuto(ctx, f, p+".mlp.0.weight")
 		if err != nil {
 			return nil, err
 		}
-		b.mlp0W = ml.Transpose(t, 1, 0)
+		if len(t.Shape) != 2 {
+			return nil, fmt.Errorf("model: encoder: invalid %s.mlp.0.weight shape %v", p, t.Shape)
+		}
+		if t.Shape[0] == 4*int(nAudioState) && t.Shape[1] == int(nAudioState) {
+			b.mlp0W = t
+		} else if t.Shape[0] == int(nAudioState) && t.Shape[1] == 4*int(nAudioState) {
+			b.mlp0W = ml.Transpose(t, 1, 0)
+		} else {
+			return nil, fmt.Errorf("model: encoder: unsupported %s.mlp.0.weight shape %v", p, t.Shape)
+		}
 
-		if b.mlp0B, err = loadTensor(ctx, f, p+".mlp.0.bias"); err != nil {
+		if b.mlp0B, _, err = loadTensorAuto(ctx, f, p+".mlp.0.bias"); err != nil {
 			return nil, err
 		}
-		// GGUF mlp.2.weight is [4*nAudioState, nAudioState]; MatMulTransB needs [D, 4D].
-		t, err = loadTensor(ctx, f, p+".mlp.2.weight")
+		// Desired layout for MatMulTransB is [D, 4D].
+		t, _, err = loadTensorAuto(ctx, f, p+".mlp.2.weight")
 		if err != nil {
 			return nil, err
 		}
-		b.mlp2W = ml.Transpose(t, 1, 0)
+		if len(t.Shape) != 2 {
+			return nil, fmt.Errorf("model: encoder: invalid %s.mlp.2.weight shape %v", p, t.Shape)
+		}
+		if t.Shape[0] == int(nAudioState) && t.Shape[1] == 4*int(nAudioState) {
+			b.mlp2W = t
+		} else if t.Shape[0] == 4*int(nAudioState) && t.Shape[1] == int(nAudioState) {
+			b.mlp2W = ml.Transpose(t, 1, 0)
+		} else {
+			return nil, fmt.Errorf("model: encoder: unsupported %s.mlp.2.weight shape %v", p, t.Shape)
+		}
 
-		if b.mlp2B, err = loadTensor(ctx, f, p+".mlp.2.bias"); err != nil {
+		if b.mlp2B, _, err = loadTensorAuto(ctx, f, p+".mlp.2.bias"); err != nil {
 			return nil, err
 		}
 	}
 
-	if e.lnPostW, err = loadTensor(ctx, f, "encoder.ln_post.weight"); err != nil {
+	if e.lnPostW, _, err = loadTensorAuto(ctx, f, "encoder.ln_post.weight"); err != nil {
 		return nil, err
 	}
-	if e.lnPostB, err = loadTensor(ctx, f, "encoder.ln_post.bias"); err != nil {
+	if e.lnPostB, _, err = loadTensorAuto(ctx, f, "encoder.ln_post.bias"); err != nil {
 		return nil, err
 	}
 
@@ -198,6 +283,11 @@ func (e *WhisperEncoder) Encode(ctx context.Context, mel ml.Tensor) (ml.Tensor, 
 		return ml.Tensor{}, fmt.Errorf("model: encoder: mel must be [%d, T], got %v", e.nMels, mel.Shape)
 	}
 	T := mel.Shape[1]
+	if T == 2*e.nAudioCtx+1 {
+		// Some pipelines produce one extra STFT frame at chunk boundaries.
+		mel = ml.From(mel.Data[:e.nMels*(2*e.nAudioCtx)], e.nMels, 2*e.nAudioCtx)
+		T = mel.Shape[1]
+	}
 	if T > 2*e.nAudioCtx {
 		return ml.Tensor{}, fmt.Errorf("model: encoder: T=%d > 2*n_audio_ctx=%d", T, 2*e.nAudioCtx)
 	}

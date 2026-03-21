@@ -1,0 +1,40 @@
+package inspectgguf
+package main
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+}	}		}			}				break			if count >= 10 {			count++			fmt.Printf("  %s: dtype=%d\n", name, qt)			qt, ok := f.TensorType(name)		if strings.Contains(name, "q_proj") || (strings.Contains(name, "attn") && strings.Contains(name, "weight")) {	for _, name := range f.TensorNames() {	count := 0	fmt.Printf("Sample tensors with attention/proj:\n")	defer f.Close()	}		os.Exit(1)		fmt.Fprintf(os.Stderr, "Error: %v\n", err)	if err != nil {	f, err := gguf.Open(ctx, os.Args[1])	ctx := context.Background()	}		os.Exit(1)		fmt.Println("usage: go run ./cmd/inspect-gguf/main.go <model.gguf>")	if len(os.Args) < 2 {func main() {)	"github.com/wxcdart/whisper.go/internal/gguf"	"strings"	"os"	"fmt"	"context"import (

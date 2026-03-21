@@ -65,15 +65,18 @@ func ScaledDotProductAttention(ctx context.Context, q, k, v Tensor, causal, retu
 				kOff := h * Tk * headDim
 				vOff := h * Tk * headDim
 
-				// scores[i,j] = dot(q[i], k[j]) * scale
-				for i := 0; i < Tq; i++ {
-					for j := 0; j < Tk; j++ {
-						var dot float32
-						for d := 0; d < headDim; d++ {
-							dot += q.Data[qOff+i*headDim+d] * k.Data[kOff+j*headDim+d]
-						}
-						scores[i*Tk+j] = dot * scale
-					}
+				// Fast path: use BLAS gemm for Q @ K^T
+				// Q: [Tq, headDim], K: [Tk, headDim] → scores: [Tq, Tk]
+				qTensor := Tensor{Shape: []int{Tq, headDim}, Data: q.Data[qOff : qOff+Tq*headDim]}
+				kTensor := Tensor{Shape: []int{Tk, headDim}, Data: k.Data[kOff : kOff+Tk*headDim]}
+				scoresTensor, err := MatMulTransB(ctx, qTensor, kTensor)
+				if err != nil {
+					return err
+				}
+				copy(scores, scoresTensor.Data)
+				// Apply scale
+				for i := range scores {
+					scores[i] *= scale
 				}
 
 				// causal mask: positions j > i get -inf
@@ -109,17 +112,16 @@ func ScaledDotProductAttention(ctx context.Context, q, k, v Tensor, causal, retu
 					copy(wTensor.Data[wOff:wOff+Tq*Tk], scores)
 				}
 
-				// out[h,i,d] = sum_j scores[i,j] * v[h,j,d]
-				oOff := h * Tq * headDim
-				for i := 0; i < Tq; i++ {
-					for d := 0; d < headDim; d++ {
-						var sum float32
-						for j := 0; j < Tk; j++ {
-							sum += scores[i*Tk+j] * v.Data[vOff+j*headDim+d]
-						}
-						outTensor.Data[oOff+i*headDim+d] = sum
-					}
+				// out[h] = scores @ V where:
+				// scores: [Tq, Tk], V: [Tk, headDim], out: [Tq, headDim]
+				scoresTensor := Tensor{Shape: []int{Tq, Tk}, Data: scores}
+				vTensor := Tensor{Shape: []int{Tk, headDim}, Data: v.Data[vOff : vOff+Tk*headDim]}
+				headOut, err := MatMul(gctx, scoresTensor, vTensor)
+				if err != nil {
+					return err
 				}
+				oOff := h * Tq * headDim
+				copy(outTensor.Data[oOff:oOff+Tq*headDim], headOut.Data)
 			}
 			return nil
 		})

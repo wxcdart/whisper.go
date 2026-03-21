@@ -67,35 +67,71 @@ type WhisperDecoder struct {
 // NewDecoder loads a decoder from an open GGUF file.
 func NewDecoder(f *gguf.File) (*WhisperDecoder, error) {
 	ctx := context.Background()
+	var err error
 
-	getMeta := func(key string) (uint32, error) {
-		v, ok := f.MetaUint32(key)
-		if !ok {
-			return 0, fmt.Errorf("model: decoder: missing metadata %q", key)
+	nHead, _ := getMetaAny(f, "whisper.decoder.attention.head_count")
+	nLayers, _ := getMetaAny(f, "whisper.decoder.layer_count")
+	nTextCtx, _ := getMetaAny(f, "whisper.decoder.context_length")
+	nTextState, _ := getMetaAny(f, "whisper.decoder.embedding_length")
+	nVocab, _ := getMetaAny(f, "whisper.vocab.size", "whisper.n_vocab")
+
+	if nLayers == 0 {
+		if c, ok := inferLayerCount(f, "decoder.blocks.%d.self_attn.query.weight"); ok {
+			nLayers = uint32(c)
 		}
-		return v, nil
 	}
 
-	nHead, err := getMeta("whisper.decoder.attention.head_count")
-	if err != nil {
-		return nil, err
-	}
-	nLayers, err := getMeta("whisper.decoder.layer_count")
-	if err != nil {
-		return nil, err
-	}
-	nTextCtx, err := getMeta("whisper.decoder.context_length")
-	if err != nil {
-		return nil, err
-	}
-	nTextState, err := getMeta("whisper.decoder.embedding_length")
-	if err != nil {
-		return nil, err
+	if attnShape, err := loadTensorShape(ctx, f, "decoder.blocks.0.self_attn.query.weight"); err == nil {
+		if len(attnShape) == 2 && attnShape[0] == attnShape[1] && attnShape[0] > 0 {
+			nTextState = uint32(attnShape[0])
+		}
 	}
 
-	nVocab, err := getMeta("whisper.vocab.size")
-	if err != nil {
-		return nil, err
+	if nTextCtx == 0 || nTextState == 0 {
+		posShape, err := loadTensorShape(ctx, f, "decoder.positional_embedding")
+		if err != nil {
+			return nil, err
+		}
+		if len(posShape) != 2 {
+			return nil, fmt.Errorf("model: decoder: invalid positional embedding shape %v", posShape)
+		}
+		if nTextState > 0 {
+			if posShape[0] == int(nTextState) && posShape[1] != int(nTextState) {
+				nTextCtx = uint32(posShape[1])
+			} else if posShape[1] == int(nTextState) {
+				nTextCtx = uint32(posShape[0])
+			}
+		} else {
+			nTextCtx = uint32(posShape[0])
+			nTextState = uint32(posShape[1])
+		}
+	}
+
+	if nVocab == 0 {
+		tokShape, err := loadTensorShape(ctx, f, "decoder.token_embedding.weight")
+		if err != nil {
+			return nil, err
+		}
+		if len(tokShape) != 2 {
+			return nil, fmt.Errorf("model: decoder: invalid token embedding shape %v", tokShape)
+		}
+		if nTextState > 0 {
+			if tokShape[1] == int(nTextState) {
+				nVocab = uint32(tokShape[0])
+			} else if tokShape[0] == int(nTextState) {
+				nVocab = uint32(tokShape[1])
+			}
+		} else {
+			nVocab = uint32(tokShape[0])
+			nTextState = uint32(tokShape[1])
+		}
+	}
+
+	if nHead == 0 {
+		if nTextState%whisperHeadDim != 0 {
+			return nil, fmt.Errorf("model: decoder: cannot infer head count from embedding length %d", nTextState)
+		}
+		nHead = nTextState / whisperHeadDim
 	}
 
 	d := &WhisperDecoder{
@@ -109,13 +145,25 @@ func NewDecoder(f *gguf.File) (*WhisperDecoder, error) {
 	}
 
 	// Load token embedding [nVocab, nTextState].
-	if d.tokenEmb, err = loadTensor(ctx, f, "decoder.token_embedding.weight"); err != nil {
+	if d.tokenEmb, _, err = loadTensorAuto(ctx, f, "decoder.token_embedding.weight"); err != nil {
 		return nil, err
+	}
+	if len(d.tokenEmb.Shape) != 2 {
+		return nil, fmt.Errorf("model: decoder: invalid token embedding shape %v", d.tokenEmb.Shape)
+	}
+	if d.tokenEmb.Shape[0] == d.nTextState && d.tokenEmb.Shape[1] == d.nVocab {
+		d.tokenEmb = ml.Transpose(d.tokenEmb, 1, 0)
 	}
 
 	// Load positional embedding [nTextCtx, nTextState].
-	if d.posEmb, err = loadTensor(ctx, f, "decoder.positional_embedding"); err != nil {
+	if d.posEmb, _, err = loadTensorAuto(ctx, f, "decoder.positional_embedding"); err != nil {
 		return nil, err
+	}
+	if len(d.posEmb.Shape) != 2 {
+		return nil, fmt.Errorf("model: decoder: invalid positional embedding shape %v", d.posEmb.Shape)
+	}
+	if d.posEmb.Shape[0] == d.nTextState && d.posEmb.Shape[1] == d.nTextCtx {
+		d.posEmb = ml.Transpose(d.posEmb, 1, 0)
 	}
 
 	// Load transformer blocks.
@@ -124,101 +172,119 @@ func NewDecoder(f *gguf.File) (*WhisperDecoder, error) {
 		p := fmt.Sprintf("decoder.blocks.%d", i)
 
 		// Self-attention layer norm.
-		if b.sAttnLnW, err = loadTensor(ctx, f, p+".self_attn_ln.weight"); err != nil {
+		if b.sAttnLnW, _, err = loadTensorAuto(ctx, f, p+".self_attn_ln.weight"); err != nil {
 			return nil, err
 		}
-		if b.sAttnLnB, err = loadTensor(ctx, f, p+".self_attn_ln.bias"); err != nil {
+		if b.sAttnLnB, _, err = loadTensorAuto(ctx, f, p+".self_attn_ln.bias"); err != nil {
 			return nil, err
 		}
 
 		// Self-attention weights.
-		if b.selfAttn.qW, err = loadTensor(ctx, f, p+".self_attn.query.weight"); err != nil {
+		if b.selfAttn.qW, _, err = loadTensorAuto(ctx, f, p+".self_attn.query.weight"); err != nil {
 			return nil, err
 		}
-		if b.selfAttn.qB, err = loadTensor(ctx, f, p+".self_attn.query.bias"); err != nil {
+		if b.selfAttn.qB, _, err = loadTensorAuto(ctx, f, p+".self_attn.query.bias"); err != nil {
 			return nil, err
 		}
-		if b.selfAttn.kW, err = loadTensor(ctx, f, p+".self_attn.key.weight"); err != nil {
+		if b.selfAttn.kW, _, err = loadTensorAuto(ctx, f, p+".self_attn.key.weight"); err != nil {
 			return nil, err
 		}
-		if b.selfAttn.vW, err = loadTensor(ctx, f, p+".self_attn.value.weight"); err != nil {
+		if b.selfAttn.vW, _, err = loadTensorAuto(ctx, f, p+".self_attn.value.weight"); err != nil {
 			return nil, err
 		}
-		if b.selfAttn.vB, err = loadTensor(ctx, f, p+".self_attn.value.bias"); err != nil {
+		if b.selfAttn.vB, _, err = loadTensorAuto(ctx, f, p+".self_attn.value.bias"); err != nil {
 			return nil, err
 		}
-		if b.selfAttn.outW, err = loadTensor(ctx, f, p+".self_attn.out.weight"); err != nil {
+		if b.selfAttn.outW, _, err = loadTensorAuto(ctx, f, p+".self_attn.out.weight"); err != nil {
 			return nil, err
 		}
-		if b.selfAttn.outB, err = loadTensor(ctx, f, p+".self_attn.out.bias"); err != nil {
+		if b.selfAttn.outB, _, err = loadTensorAuto(ctx, f, p+".self_attn.out.bias"); err != nil {
 			return nil, err
 		}
 
 		// Cross-attention layer norm.
-		if b.cAttnLnW, err = loadTensor(ctx, f, p+".cross_attn_ln.weight"); err != nil {
+		if b.cAttnLnW, _, err = loadTensorAuto(ctx, f, p+".cross_attn_ln.weight"); err != nil {
 			return nil, err
 		}
-		if b.cAttnLnB, err = loadTensor(ctx, f, p+".cross_attn_ln.bias"); err != nil {
+		if b.cAttnLnB, _, err = loadTensorAuto(ctx, f, p+".cross_attn_ln.bias"); err != nil {
 			return nil, err
 		}
 
 		// Cross-attention weights.
-		if b.crossAttn.qW, err = loadTensor(ctx, f, p+".cross_attn.query.weight"); err != nil {
+		if b.crossAttn.qW, _, err = loadTensorAuto(ctx, f, p+".cross_attn.query.weight"); err != nil {
 			return nil, err
 		}
-		if b.crossAttn.qB, err = loadTensor(ctx, f, p+".cross_attn.query.bias"); err != nil {
+		if b.crossAttn.qB, _, err = loadTensorAuto(ctx, f, p+".cross_attn.query.bias"); err != nil {
 			return nil, err
 		}
-		if b.crossAttn.kW, err = loadTensor(ctx, f, p+".cross_attn.key.weight"); err != nil {
+		if b.crossAttn.kW, _, err = loadTensorAuto(ctx, f, p+".cross_attn.key.weight"); err != nil {
 			return nil, err
 		}
-		if b.crossAttn.vW, err = loadTensor(ctx, f, p+".cross_attn.value.weight"); err != nil {
+		if b.crossAttn.vW, _, err = loadTensorAuto(ctx, f, p+".cross_attn.value.weight"); err != nil {
 			return nil, err
 		}
-		if b.crossAttn.vB, err = loadTensor(ctx, f, p+".cross_attn.value.bias"); err != nil {
+		if b.crossAttn.vB, _, err = loadTensorAuto(ctx, f, p+".cross_attn.value.bias"); err != nil {
 			return nil, err
 		}
-		if b.crossAttn.outW, err = loadTensor(ctx, f, p+".cross_attn.out.weight"); err != nil {
+		if b.crossAttn.outW, _, err = loadTensorAuto(ctx, f, p+".cross_attn.out.weight"); err != nil {
 			return nil, err
 		}
-		if b.crossAttn.outB, err = loadTensor(ctx, f, p+".cross_attn.out.bias"); err != nil {
+		if b.crossAttn.outB, _, err = loadTensorAuto(ctx, f, p+".cross_attn.out.bias"); err != nil {
 			return nil, err
 		}
 
 		// MLP layer norm.
-		if b.mlpLnW, err = loadTensor(ctx, f, p+".mlp_ln.weight"); err != nil {
+		if b.mlpLnW, _, err = loadTensorAuto(ctx, f, p+".mlp_ln.weight"); err != nil {
 			return nil, err
 		}
-		if b.mlpLnB, err = loadTensor(ctx, f, p+".mlp_ln.bias"); err != nil {
-			return nil, err
-		}
-
-		// MLP weights: mlp.0.weight [nTextState, 4*nTextState] (stored as [4D, D]).
-		t, err := loadTensor(ctx, f, p+".mlp.0.weight")
-		if err != nil {
-			return nil, err
-		}
-		b.mlp0W = ml.Transpose(t, 1, 0)
-		if b.mlp0B, err = loadTensor(ctx, f, p+".mlp.0.bias"); err != nil {
+		if b.mlpLnB, _, err = loadTensorAuto(ctx, f, p+".mlp_ln.bias"); err != nil {
 			return nil, err
 		}
 
-		// MLP weights: mlp.2.weight [4*nTextState, nTextState] (stored as [D, 4D]).
-		t, err = loadTensor(ctx, f, p+".mlp.2.weight")
+		// Desired layout for MatMulTransB is [4D, D].
+		t, _, err := loadTensorAuto(ctx, f, p+".mlp.0.weight")
 		if err != nil {
 			return nil, err
 		}
-		b.mlp2W = ml.Transpose(t, 1, 0)
-		if b.mlp2B, err = loadTensor(ctx, f, p+".mlp.2.bias"); err != nil {
+		if len(t.Shape) != 2 {
+			return nil, fmt.Errorf("model: decoder: invalid %s.mlp.0.weight shape %v", p, t.Shape)
+		}
+		if t.Shape[0] == 4*int(nTextState) && t.Shape[1] == int(nTextState) {
+			b.mlp0W = t
+		} else if t.Shape[0] == int(nTextState) && t.Shape[1] == 4*int(nTextState) {
+			b.mlp0W = ml.Transpose(t, 1, 0)
+		} else {
+			return nil, fmt.Errorf("model: decoder: unsupported %s.mlp.0.weight shape %v", p, t.Shape)
+		}
+		if b.mlp0B, _, err = loadTensorAuto(ctx, f, p+".mlp.0.bias"); err != nil {
+			return nil, err
+		}
+
+		// Desired layout for MatMulTransB is [D, 4D].
+		t, _, err = loadTensorAuto(ctx, f, p+".mlp.2.weight")
+		if err != nil {
+			return nil, err
+		}
+		if len(t.Shape) != 2 {
+			return nil, fmt.Errorf("model: decoder: invalid %s.mlp.2.weight shape %v", p, t.Shape)
+		}
+		if t.Shape[0] == int(nTextState) && t.Shape[1] == 4*int(nTextState) {
+			b.mlp2W = t
+		} else if t.Shape[0] == 4*int(nTextState) && t.Shape[1] == int(nTextState) {
+			b.mlp2W = ml.Transpose(t, 1, 0)
+		} else {
+			return nil, fmt.Errorf("model: decoder: unsupported %s.mlp.2.weight shape %v", p, t.Shape)
+		}
+		if b.mlp2B, _, err = loadTensorAuto(ctx, f, p+".mlp.2.bias"); err != nil {
 			return nil, err
 		}
 	}
 
 	// Load final layer norm.
-	if d.lnW, err = loadTensor(ctx, f, "decoder.ln.weight"); err != nil {
+	if d.lnW, _, err = loadTensorAuto(ctx, f, "decoder.ln.weight"); err != nil {
 		return nil, err
 	}
-	if d.lnB, err = loadTensor(ctx, f, "decoder.ln.bias"); err != nil {
+	if d.lnB, _, err = loadTensorAuto(ctx, f, "decoder.ln.bias"); err != nil {
 		return nil, err
 	}
 
@@ -262,6 +328,12 @@ func (d *WhisperDecoder) decodeGreedy(ctx context.Context, encoderOut ml.Tensor,
 	maxTokens := params.MaxTokens
 	if maxTokens <= 0 {
 		maxTokens = d.nTextCtx
+	}
+	if capFromCtx := d.nTextCtx - len(params.Prompt); capFromCtx < maxTokens {
+		maxTokens = capFromCtx
+	}
+	if maxTokens < 0 {
+		maxTokens = 0
 	}
 
 	for len(state.tokens) < len(params.Prompt)+maxTokens {
@@ -318,6 +390,12 @@ func (d *WhisperDecoder) decodeBeamSearch(ctx context.Context, encoderOut ml.Ten
 	maxTokens := params.MaxTokens
 	if maxTokens <= 0 {
 		maxTokens = d.nTextCtx
+	}
+	if capFromCtx := d.nTextCtx - len(params.Prompt); capFromCtx < maxTokens {
+		maxTokens = capFromCtx
+	}
+	if maxTokens < 0 {
+		maxTokens = 0
 	}
 
 	for step := 0; step < maxTokens; step++ {

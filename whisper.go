@@ -2,7 +2,13 @@ package whisper
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strings"
 
 	"github.com/whispergo/whisper.go/internal/dtw"
 	"github.com/whispergo/whisper.go/internal/gguf"
@@ -16,41 +22,41 @@ const SampleRate = 16000
 
 // Context holds a loaded model and is safe for concurrent use across multiple Transcribe calls.
 type Context struct {
-	enc       model.Encoder
-	dec       model.Decoder
-	vocab     *vocab.Vocabulary
-	pipeline  *model.WhisperPipeline
+	enc        model.Encoder
+	dec        model.Decoder
+	vocab      *vocab.Vocabulary
+	pipeline   *model.WhisperPipeline
 	dtwAligner *dtw.Aligner
-	vadModel  *vad.SileroVAD
-	file      *gguf.File
+	vadModel   *vad.SileroVAD
+	file       *gguf.File
 }
 
 // Params controls transcription behaviour.
 type Params struct {
-	Language        string // BCP-47 language code, empty = auto-detect
-	Task            Task
-	Threads         int
-	Processors      int
-	BeamSize        int
-	BestOf          int
-	Temperature     float32
-	TemperatureInc  float32
-	EntropyThold    float32
-	LogprobThold    float32
-	NoSpeechThold   float32
-	NoFallback      bool
-	MaxLen          int
-	SplitOnWord     bool
-	NoTimestamps    bool
-	InitialPrompt   string
+	Language           string // BCP-47 language code, empty = auto-detect
+	Task               Task
+	Threads            int
+	Processors         int
+	BeamSize           int
+	BestOf             int
+	Temperature        float32
+	TemperatureInc     float32
+	EntropyThold       float32
+	LogprobThold       float32
+	NoSpeechThold      float32
+	NoFallback         bool
+	MaxLen             int
+	SplitOnWord        bool
+	NoTimestamps       bool
+	InitialPrompt      string
 	CarryInitialPrompt bool
-	OffsetMs        int
-	DurationMs      int
-	MaxContext      int
-	AudioCtx        int
-	SuppressNST     bool
-	SuppressRegex   string
-	DTWPreset       string
+	OffsetMs           int
+	DurationMs         int
+	MaxContext         int
+	AudioCtx           int
+	SuppressNST        bool
+	SuppressRegex      string
+	DTWPreset          string
 	// VAD
 	VADEnabled        bool
 	VADModelPath      string
@@ -149,7 +155,7 @@ func New(ctx context.Context, modelPath string, params ...Params) (*Context, err
 	}
 
 	// Load vocabulary
-	v, err := loadVocabFromGGUF(f)
+	v, err := loadVocabFromGGUF(f, modelPath)
 	if err != nil {
 		f.Close()
 		return nil, fmt.Errorf("load vocab: %w", err)
@@ -228,31 +234,200 @@ func (c *Context) Close() error {
 }
 
 // loadVocabFromGGUF extracts tokens and token types from GGUF metadata.
-func loadVocabFromGGUF(f *gguf.File) (*vocab.Vocabulary, error) {
-	// Get tokens metadata
-	tokensRaw, ok := f.Meta("tokenizer.ggml.tokens")
-	if !ok {
-		return nil, fmt.Errorf("tokenizer.ggml.tokens not found in GGUF")
+func loadVocabFromGGUF(f *gguf.File, modelPath string) (*vocab.Vocabulary, error) {
+	getMetaAny := func(keys ...string) (any, bool) {
+		for _, k := range keys {
+			if v, ok := f.Meta(k); ok {
+				return v, true
+			}
+		}
+		return nil, false
 	}
 
-	tokens, ok := tokensRaw.([]string)
+	// Get tokens metadata from known key variants.
+	tokensRaw, ok := getMetaAny(
+		"tokenizer.ggml.tokens",
+		"tokenizer.tokens",
+	)
 	if !ok {
-		return nil, fmt.Errorf("tokenizer.ggml.tokens is not []string")
+		expectedVocab := 0
+		if v, ok := f.MetaUint32("whisper.vocab.size"); ok {
+			expectedVocab = int(v)
+		} else if v, ok := f.MetaUint32("whisper.n_vocab"); ok {
+			expectedVocab = int(v)
+		}
+		return loadVocabFromTokenizerFile(modelPath, expectedVocab)
 	}
 
-	// Get token types metadata
-	typesRaw, ok := f.Meta("tokenizer.ggml.token_type")
-	if !ok {
-		return nil, fmt.Errorf("tokenizer.ggml.token_type not found in GGUF")
+	toStrings := func(v any) ([]string, bool) {
+		s, ok := v.([]string)
+		if ok {
+			return s, true
+		}
+		items, ok := v.([]any)
+		if !ok {
+			return nil, false
+		}
+		out := make([]string, len(items))
+		for i, it := range items {
+			ts, ok := it.(string)
+			if !ok {
+				return nil, false
+			}
+			out[i] = ts
+		}
+		return out, true
 	}
 
-	types, ok := typesRaw.([]uint32)
+	tokens, ok := toStrings(tokensRaw)
 	if !ok {
-		return nil, fmt.Errorf("tokenizer.ggml.token_type is not []uint32")
+		return nil, fmt.Errorf("tokenizer tokens metadata has unsupported type %T", tokensRaw)
+	}
+
+	// Get token types metadata from known key variants.
+	typesRaw, ok := getMetaAny(
+		"tokenizer.ggml.token_type",
+		"tokenizer.token_type",
+	)
+	if !ok {
+		return nil, fmt.Errorf("token type metadata not found in GGUF (tried tokenizer.ggml.token_type/tokenizer.token_type)")
+	}
+
+	toUint32s := func(v any) ([]uint32, bool) {
+		u, ok := v.([]uint32)
+		if ok {
+			return u, true
+		}
+		items, ok := v.([]any)
+		if !ok {
+			return nil, false
+		}
+		out := make([]uint32, len(items))
+		for i, it := range items {
+			tv, ok := it.(uint32)
+			if !ok {
+				return nil, false
+			}
+			out[i] = tv
+		}
+		return out, true
+	}
+
+	types, ok := toUint32s(typesRaw)
+	if !ok {
+		return nil, fmt.Errorf("tokenizer token_type metadata has unsupported type %T", typesRaw)
 	}
 
 	// Create vocabulary
 	return vocab.New(tokens, types)
+}
+
+var timestampTokenRe = regexp.MustCompile(`^<\|\d+\.\d+\|>$`)
+
+type hfAddedToken struct {
+	ID      int    `json:"id"`
+	Content string `json:"content"`
+	Special bool   `json:"special"`
+}
+
+type hfTokenizerFile struct {
+	AddedTokens []hfAddedToken `json:"added_tokens"`
+	Model       struct {
+		Vocab map[string]int `json:"vocab"`
+	} `json:"model"`
+}
+
+func loadVocabFromTokenizerFile(modelPath string, expectedVocab int) (*vocab.Vocabulary, error) {
+	tokPath, err := findTokenizerFile(modelPath)
+	if err != nil {
+		return nil, fmt.Errorf("tokenizer metadata not found in GGUF and sidecar tokenizer file not found near %q", modelPath)
+	}
+
+	buf, err := os.ReadFile(tokPath)
+	if err != nil {
+		return nil, fmt.Errorf("read sidecar tokenizer %q: %w", tokPath, err)
+	}
+
+	var tok hfTokenizerFile
+	if err := json.Unmarshal(buf, &tok); err != nil {
+		return nil, fmt.Errorf("parse sidecar tokenizer %q: %w", tokPath, err)
+	}
+
+	maxID := -1
+	for _, id := range tok.Model.Vocab {
+		if id > maxID {
+			maxID = id
+		}
+	}
+	for _, t := range tok.AddedTokens {
+		if t.ID > maxID {
+			maxID = t.ID
+		}
+	}
+	if expectedVocab > 0 && expectedVocab-1 > maxID {
+		maxID = expectedVocab - 1
+	}
+	if maxID < 0 {
+		return nil, fmt.Errorf("sidecar tokenizer %q has no vocabulary entries", tokPath)
+	}
+
+	tokens := make([]string, maxID+1)
+	types := make([]uint32, maxID+1)
+
+	for token, id := range tok.Model.Vocab {
+		if id >= 0 && id < len(tokens) {
+			tokens[id] = token
+			types[id] = 0
+		}
+	}
+	for _, t := range tok.AddedTokens {
+		if t.ID >= 0 && t.ID < len(tokens) {
+			tokens[t.ID] = t.Content
+			types[t.ID] = 1
+		}
+	}
+
+	for i := range tokens {
+		if tokens[i] == "" {
+			tokens[i] = fmt.Sprintf("<|missing_%d|>", i)
+		}
+		if timestampTokenRe.MatchString(tokens[i]) {
+			types[i] = 3
+		}
+		if strings.HasPrefix(tokens[i], "<|") && strings.HasSuffix(tokens[i], "|>") && types[i] == 0 {
+			types[i] = 1
+		}
+	}
+
+	return vocab.New(tokens, types)
+}
+
+func findTokenizerFile(modelPath string) (string, error) {
+	dir := filepath.Dir(modelPath)
+	primary := filepath.Join(dir, "tokenizer.json")
+	if st, err := os.Stat(primary); err == nil && !st.IsDir() {
+		return primary, nil
+	}
+
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		return "", err
+	}
+	var matches []string
+	for _, e := range ents {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if strings.HasPrefix(name, "tokenizer") && strings.HasSuffix(name, ".json") {
+			matches = append(matches, filepath.Join(dir, name))
+		}
+	}
+	if len(matches) == 0 {
+		return "", fmt.Errorf("not found")
+	}
+	sort.Strings(matches)
+	return matches[0], nil
 }
 
 // convertSegments converts internal segments to public segments.
