@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
+	"sort"
 
 	"github.com/whispergo/whisper.go/internal/gguf"
 	"github.com/whispergo/whisper.go/internal/ml"
@@ -309,10 +310,13 @@ type decoderScratch struct {
 	q      ml.Tensor // [1, nTextState]
 	k      ml.Tensor // [1, nTextState]
 	v      ml.Tensor // [1, nTextState]
+	attn   ml.Tensor // [nHead, 1, headDim]
 	out    ml.Tensor // [1, nTextState]
 	mlpH   ml.Tensor // [1, 4*nTextState]
 	kFull  ml.Tensor // [nHead, nTextCtx, headDim]
 	vFull  ml.Tensor // [nHead, nTextCtx, headDim]
+	selfS  ml.Tensor // [nHead, 1, nTextCtx]
+	crossS ml.Tensor // [nHead, 1, encLen]
 	logits ml.Tensor // [1, nVocab]
 }
 
@@ -334,53 +338,21 @@ func (d *WhisperDecoder) newDecoderState(prompt []int32) *decoderState {
 		q:      ml.New(1, d.nTextState),
 		k:      ml.New(1, d.nTextState),
 		v:      ml.New(1, d.nTextState),
+		attn:   ml.New(d.nHead, 1, headDim),
 		out:    ml.New(1, d.nTextState),
 		mlpH:   ml.New(1, 4*d.nTextState),
 		kFull:  ml.New(d.nHead, d.nTextCtx, headDim),
 		vFull:  ml.New(d.nHead, d.nTextCtx, headDim),
+		selfS:  ml.New(d.nHead, 1, d.nTextCtx),
 		logits: ml.New(1, d.nVocab),
 	}
 
 	return state
 }
 
-func addInPlace(dst, src ml.Tensor) {
-	for i := range dst.Data {
-		dst.Data[i] += src.Data[i]
-	}
-}
-
 func addBiasRowInPlace(dst, bias ml.Tensor) {
 	for i := range bias.Data {
 		dst.Data[i] += bias.Data[i]
-	}
-}
-
-func geluInPlace(dst ml.Tensor) {
-	const sqrt2OverPi = 0.7978845608028654
-	for i, x := range dst.Data {
-		inner := sqrt2OverPi * (x + 0.044715*x*x*x)
-		dst.Data[i] = x * 0.5 * float32(1+math.Tanh(float64(inner)))
-	}
-}
-
-func layerNormRowInto(src, weight, bias, out ml.Tensor, eps float32) {
-	C := src.Shape[len(src.Shape)-1]
-	row := src.Data[:C]
-	var mean float32
-	for _, v := range row {
-		mean += v
-	}
-	mean /= float32(C)
-	var vari float32
-	for _, v := range row {
-		d := v - mean
-		vari += d * d
-	}
-	vari /= float32(C)
-	std := float32(math.Sqrt(float64(vari + eps)))
-	for i, v := range row {
-		out.Data[i] = weight.Data[i]*(v-mean)/std + bias.Data[i]
 	}
 }
 
@@ -611,28 +583,40 @@ func (d *WhisperDecoder) forward(ctx context.Context, state *decoderState, encod
 
 		// Self-attention with KV cache.
 		xln := state.scratch.xln
-		layerNormRowInto(x, b.sAttnLnW, b.sAttnLnB, xln, layerNormEps)
+		if err := ml.LayerNormInto(xln, x, b.sAttnLnW, b.sAttnLnB, layerNormEps); err != nil {
+			return nil, fmt.Errorf("model: decode: block %d self_attn layernorm: %w", i, err)
+		}
 		attnOut, err := d.runDecoderSelfAttn(ctx, state, xln, b.selfAttn, nextPos, i, headDim)
 		if err != nil {
 			return nil, fmt.Errorf("model: decode: block %d self_attn: %w", i, err)
 		}
-		addInPlace(x, attnOut)
+		if err := ml.AddInPlace(x, attnOut); err != nil {
+			return nil, fmt.Errorf("model: decode: block %d self_attn residual: %w", i, err)
+		}
 
 		// Cross-attention to encoder output.
-		layerNormRowInto(x, b.cAttnLnW, b.cAttnLnB, xln, layerNormEps)
+		if err := ml.LayerNormInto(xln, x, b.cAttnLnW, b.cAttnLnB, layerNormEps); err != nil {
+			return nil, fmt.Errorf("model: decode: block %d cross_attn layernorm: %w", i, err)
+		}
 		crossOut, err := d.runDecoderCrossAttn(ctx, state, xln, encoderOut, b.crossAttn, i, headDim)
 		if err != nil {
 			return nil, fmt.Errorf("model: decode: block %d cross_attn: %w", i, err)
 		}
-		addInPlace(x, crossOut)
+		if err := ml.AddInPlace(x, crossOut); err != nil {
+			return nil, fmt.Errorf("model: decode: block %d cross_attn residual: %w", i, err)
+		}
 
 		// MLP sub-layer.
-		layerNormRowInto(x, b.mlpLnW, b.mlpLnB, xln, layerNormEps)
+		if err := ml.LayerNormInto(xln, x, b.mlpLnW, b.mlpLnB, layerNormEps); err != nil {
+			return nil, fmt.Errorf("model: decode: block %d mlp layernorm: %w", i, err)
+		}
 		mlpOut, err := d.runMLP(ctx, state, xln, b)
 		if err != nil {
 			return nil, fmt.Errorf("model: decode: block %d mlp: %w", i, err)
 		}
-		addInPlace(x, mlpOut)
+		if err := ml.AddInPlace(x, mlpOut); err != nil {
+			return nil, fmt.Errorf("model: decode: block %d mlp residual: %w", i, err)
+		}
 
 		if err := ctx.Err(); err != nil {
 			return nil, fmt.Errorf("model: decode: cancelled after block %d: %w", i, err)
@@ -640,7 +624,9 @@ func (d *WhisperDecoder) forward(ctx context.Context, state *decoderState, encod
 	}
 
 	// Final layer norm.
-	layerNormRowInto(x, d.lnW, d.lnB, x, layerNormEps)
+	if err := ml.LayerNormInto(x, x, d.lnW, d.lnB, layerNormEps); err != nil {
+		return nil, fmt.Errorf("model: decode: forward: final layernorm: %w", err)
+	}
 
 	// Project to vocabulary: x @ tokenEmb^T → [1, nVocab]
 	if err := ml.MatMulTransBInto(ctx, x, d.tokenEmb, state.scratch.logits); err != nil {
@@ -714,15 +700,13 @@ func (d *WhisperDecoder) runDecoderSelfAttn(ctx context.Context, state *decoderS
 	// Reshape Q for attention: [nHead, 1, headDim]
 	q := ml.From(sc.q.Data, d.nHead, 1, headDim)
 
-	// Apply scaled dot-product attention (causal).
-	attnOut, _, err := ml.ScaledDotProductAttention(ctx, q, kFull, vFull, true, false)
-	if err != nil {
+	// Apply scaled dot-product attention (causal) into scratch buffers.
+	if err := ml.ScaledDotProductAttentionInto(ctx, q, kFull, vFull, true, sc.attn, ml.Tensor{}, ml.From(sc.selfS.Data[:d.nHead*seqLen], d.nHead, 1, seqLen)); err != nil {
 		return ml.Tensor{}, fmt.Errorf("model: decode: self_attn: attention: %w", err)
 	}
 
-	// Reshape back: [nHead, 1, headDim] → [1, nTextState]
-	// attnOut is [nHead, 1, headDim], concatenate across heads to get [1, nTextState]
-	attnOut = attnOut.Reshape(1, d.nHead*headDim)
+	// Reshape back: [nHead, 1, headDim] -> [1, nTextState]
+	attnOut := sc.attn.Reshape(1, d.nHead*headDim)
 
 	// Project output: attnOut @ outW^T + outB → [1, nTextState]
 	if err := ml.MatMulTransBInto(ctx, attnOut, attn.outW, sc.out); err != nil {
@@ -776,15 +760,17 @@ func (d *WhisperDecoder) runDecoderCrossAttn(ctx context.Context, state *decoder
 	k = k.Reshape(d.nHead, encLen, headDim)
 	v = v.Reshape(d.nHead, encLen, headDim)
 
-	// Apply scaled dot-product attention (non-causal for encoder output).
-	attnOut, _, err := ml.ScaledDotProductAttention(ctx, q, k, v, false, false)
-	if err != nil {
+	if len(sc.crossS.Shape) == 0 || sc.crossS.Shape[0] != d.nHead || sc.crossS.Shape[2] < encLen {
+		sc.crossS = ml.New(d.nHead, 1, encLen)
+	}
+
+	// Apply scaled dot-product attention (non-causal for encoder output) into scratch buffers.
+	if err := ml.ScaledDotProductAttentionInto(ctx, q, k, v, false, sc.attn, ml.Tensor{}, ml.From(sc.crossS.Data[:d.nHead*encLen], d.nHead, 1, encLen)); err != nil {
 		return ml.Tensor{}, fmt.Errorf("model: decode: cross_attn: attention: %w", err)
 	}
 
-	// Reshape back: [nHead, 1, headDim] → [1, nTextState]
-	// attnOut is [nHead, 1, headDim], concatenate across heads to get [1, nTextState]
-	attnOut = attnOut.Reshape(1, d.nHead*headDim)
+	// Reshape back: [nHead, 1, headDim] -> [1, nTextState]
+	attnOut := sc.attn.Reshape(1, d.nHead*headDim)
 
 	// Project output: attnOut @ outW^T + outB → [1, nTextState]
 	if err := ml.MatMulTransBInto(ctx, attnOut, attn.outW, sc.out); err != nil {
@@ -807,7 +793,7 @@ func (d *WhisperDecoder) runMLP(ctx context.Context, state *decoderState, x ml.T
 		return ml.Tensor{}, fmt.Errorf("model: decode: mlp.0: %w", err)
 	}
 	addBiasRowInPlace(sc.mlpH, b.mlp0B)
-	geluInPlace(sc.mlpH)
+	ml.GELUInPlace(sc.mlpH)
 
 	// MLP.2: out @ mlp2W^T + mlp2B → [1, nTextState]
 	if err := ml.MatMulTransBInto(ctx, sc.mlpH, b.mlp2W, sc.out); err != nil {
@@ -824,55 +810,59 @@ func (d *WhisperDecoder) sampleGreedy(logits []float32, temperature float32, par
 		return 0, fmt.Errorf("model: decode: sample: logits length mismatch")
 	}
 
-	// Apply temperature scaling.
-	scaledLogits := make([]float32, len(logits))
-	copy(scaledLogits, logits)
+	invTemp := float32(1.0)
 	if temperature > 0 {
-		for i := range scaledLogits {
-			scaledLogits[i] /= temperature
-		}
+		invTemp = 1 / temperature
 	}
 
-	// Compute softmax probabilities.
-	probs := d.softmax(scaledLogits)
-
-	// Find argmax token and check logprob threshold.
-	var maxIdx int
-	var maxProb float32
-	for i := 0; i < len(probs); i++ {
-		if probs[i] > maxProb {
-			maxProb = probs[i]
+	maxIdx := 0
+	maxScaled := logits[0] * invTemp
+	for i := 1; i < len(logits); i++ {
+		s := logits[i] * invTemp
+		if s > maxScaled {
+			maxScaled = s
 			maxIdx = i
 		}
 	}
 
-	// Check if top-1 probability is above threshold.
+	if params.SuppressNST && d.eotToken >= 0 && int(d.eotToken) < len(logits) {
+		if logits[d.eotToken] < -params.NoSpeechThold && maxIdx == int(d.eotToken) {
+			maxIdx = -1
+			maxScaled = float32(math.Inf(-1))
+			for i := 0; i < len(logits); i++ {
+				if i == int(d.eotToken) {
+					continue
+				}
+				s := logits[i] * invTemp
+				if s > maxScaled {
+					maxScaled = s
+					maxIdx = i
+				}
+			}
+			if maxIdx < 0 {
+				maxIdx = int(d.eotToken)
+			}
+		}
+	}
+
 	logprobThold := params.LogprobThold
-	if logprobThold > 0 && maxProb > 0 {
-		logprob := float32(math.Log(float64(maxProb)))
-		if logprob < -logprobThold {
-			// Fallback to sampling from top probabilities if enabled.
-			if !params.NoFallback && temperature > 0 {
-				return d.sampleTopP(probs, 0.9), nil // Default top-p sampling.
+	if logprobThold > 0 && !params.NoFallback && temperature > 0 {
+		scaledMax := float32(math.Inf(-1))
+		for i := 0; i < len(logits); i++ {
+			s := logits[i] * invTemp
+			if s > scaledMax {
+				scaledMax = s
 			}
 		}
-	}
 
-	// Check if no-speech token should be suppressed.
-	if params.SuppressNST && d.eotToken > 0 {
-		if logits[d.eotToken] < -params.NoSpeechThold {
-			probs[d.eotToken] = 0
+		expSum := float32(0)
+		for i := 0; i < len(logits); i++ {
+			expSum += float32(math.Exp(float64(logits[i]*invTemp - scaledMax)))
 		}
-	}
-
-	// Re-find argmax if no-speech was suppressed.
-	if params.SuppressNST {
-		maxProb = 0
-		for i := 0; i < len(probs); i++ {
-			if probs[i] > maxProb {
-				maxProb = probs[i]
-				maxIdx = i
-			}
+		logZ := float32(math.Log(float64(expSum))) + scaledMax
+		maxLogProb := logits[maxIdx]*invTemp - logZ
+		if maxLogProb < -logprobThold {
+			return d.sampleTopPFromLogits(logits, temperature, 0.9), nil
 		}
 	}
 
@@ -884,81 +874,165 @@ func (d *WhisperDecoder) topKTokens(logits []float32, k int, temperature float32
 	token   int32
 	logprob float32
 } {
-	if len(logits) != d.nVocab {
+	if len(logits) != d.nVocab || k <= 0 {
 		return nil
 	}
-
-	// Apply temperature scaling.
-	scaledLogits := make([]float32, len(logits))
-	copy(scaledLogits, logits)
-	if temperature > 0 {
-		for i := range scaledLogits {
-			scaledLogits[i] /= temperature
-		}
+	if k > len(logits) {
+		k = len(logits)
 	}
 
-	// Compute log-softmax to get log-probabilities.
-	maxLogit := scaledLogits[0]
-	for i := 1; i < len(scaledLogits); i++ {
-		if scaledLogits[i] > maxLogit {
-			maxLogit = scaledLogits[i]
+	invTemp := float32(1.0)
+	if temperature > 0 {
+		invTemp = 1 / temperature
+	}
+
+	type tokenScore struct {
+		token int32
+		score float32
+	}
+	top := make([]tokenScore, 0, k)
+	minPos := -1
+	minVal := float32(0)
+
+	scaledMax := float32(math.Inf(-1))
+	for i, lg := range logits {
+		s := lg * invTemp
+		if s > scaledMax {
+			scaledMax = s
+		}
+
+		if len(top) < k {
+			top = append(top, tokenScore{token: int32(i), score: s})
+			if minPos < 0 || s < minVal {
+				minPos = len(top) - 1
+				minVal = s
+			}
+			continue
+		}
+
+		if s <= minVal {
+			continue
+		}
+
+		top[minPos] = tokenScore{token: int32(i), score: s}
+		minPos = 0
+		minVal = top[0].score
+		for j := 1; j < len(top); j++ {
+			if top[j].score < minVal {
+				minVal = top[j].score
+				minPos = j
+			}
 		}
 	}
 
 	expSum := float32(0)
-	for i := range scaledLogits {
-		expSum += float32(math.Exp(float64(scaledLogits[i] - maxLogit)))
+	for _, lg := range logits {
+		expSum += float32(math.Exp(float64(lg*invTemp - scaledMax)))
 	}
-	logSum := float32(math.Log(float64(expSum))) + maxLogit
-
-	logProbs := make([]float32, len(scaledLogits))
-	for i := range scaledLogits {
-		logProbs[i] = scaledLogits[i] - logSum
-	}
-
-	// Find top-K indices.
-	type tokenProb struct {
-		token   int32
-		logprob float32
-	}
-	topK := make([]tokenProb, 0, k)
-	for i := 0; i < len(logProbs) && len(topK) < k; i++ {
-		topK = append(topK, tokenProb{token: int32(i), logprob: logProbs[i]})
-	}
-
-	// Simple selection (not fully sorted for efficiency).
-	for i := k; i < len(logProbs); i++ {
-		minIdx := 0
-		for j := 1; j < len(topK); j++ {
-			if logProbs[i] > logProbs[int(topK[j].token)] {
-				if logProbs[i] < logProbs[int(topK[minIdx].token)] {
-					minIdx = j
-				}
-			}
-		}
-		if i < len(logProbs) && logProbs[i] > logProbs[int(topK[minIdx].token)] {
-			topK[minIdx] = tokenProb{token: int32(i), logprob: logProbs[i]}
-		}
-	}
+	logZ := float32(math.Log(float64(expSum))) + scaledMax
 
 	result := make([]struct {
 		token   int32
 		logprob float32
-	}, len(topK))
-	for i, tp := range topK {
+	}, len(top))
+	for i, tp := range top {
 		result[i].token = tp.token
-		result[i].logprob = tp.logprob
+		result[i].logprob = tp.score - logZ
 	}
+
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].logprob > result[j].logprob
+	})
+
 	return result
 }
 
-// sampleTopP performs top-p (nucleus) sampling.
+// sampleTopPFromLogitsWithScratch performs top-p (nucleus) sampling from logits.
+// It reuses caller-provided scratch slices when capacity is sufficient.
+func (d *WhisperDecoder) sampleTopPFromLogitsWithScratch(logits []float32, temperature, topP float32, idxScratch []int, scaledScratch []float32) (int32, []int, []float32) {
+	if len(logits) == 0 {
+		return 0, idxScratch, scaledScratch
+	}
+
+	invTemp := float32(1.0)
+	if temperature > 0 {
+		invTemp = 1 / temperature
+	}
+
+	n := len(logits)
+	if cap(idxScratch) < n {
+		idxScratch = make([]int, n)
+	} else {
+		idxScratch = idxScratch[:n]
+	}
+	if cap(scaledScratch) < n {
+		scaledScratch = make([]float32, n)
+	} else {
+		scaledScratch = scaledScratch[:n]
+	}
+
+	scaledMax := logits[0] * invTemp
+	for i, lg := range logits {
+		s := lg * invTemp
+		idxScratch[i] = i
+		scaledScratch[i] = s
+		if s > scaledMax {
+			scaledMax = s
+		}
+	}
+
+	expSum := float32(0)
+	for _, s := range scaledScratch {
+		expSum += float32(math.Exp(float64(s - scaledMax)))
+	}
+	logZ := float32(math.Log(float64(expSum))) + scaledMax
+
+	sort.Slice(idxScratch, func(i, j int) bool {
+		return scaledScratch[idxScratch[i]] > scaledScratch[idxScratch[j]]
+	})
+
+	topCount := 0
+	var cumSum float32
+	for i := 0; i < len(idxScratch); i++ {
+		s := scaledScratch[idxScratch[i]]
+		p := float32(math.Exp(float64(s - logZ)))
+		cumSum += p
+		topCount = i + 1
+		if cumSum >= topP {
+			break
+		}
+	}
+
+	if topCount == 0 {
+		return int32(idxScratch[0]), idxScratch, scaledScratch
+	}
+
+	r := rand.Float32() * cumSum
+	var run float32
+	for i := 0; i < topCount; i++ {
+		idx := idxScratch[i]
+		s := scaledScratch[idx]
+		p := float32(math.Exp(float64(s - logZ)))
+		run += p
+		if run >= r {
+			return int32(idx), idxScratch, scaledScratch
+		}
+	}
+
+	return int32(idxScratch[topCount-1]), idxScratch, scaledScratch
+}
+
+// sampleTopPFromLogits performs top-p (nucleus) sampling from logits.
+func (d *WhisperDecoder) sampleTopPFromLogits(logits []float32, temperature, topP float32) int32 {
+	tok, _, _ := d.sampleTopPFromLogitsWithScratch(logits, temperature, topP, nil, nil)
+	return tok
+}
+
+// sampleTopP performs top-p (nucleus) sampling from probabilities.
 func (d *WhisperDecoder) sampleTopP(probs []float32, topP float32) int32 {
 	if len(probs) == 0 {
 		return 0
 	}
-
-	// Sort probabilities in descending order.
 	type prob struct {
 		idx  int
 		prob float32
@@ -967,51 +1041,19 @@ func (d *WhisperDecoder) sampleTopP(probs []float32, topP float32) int32 {
 	for i := range probs {
 		sorted[i] = prob{idx: i, prob: probs[i]}
 	}
-
-	// Simple sorting (bubble sort for small sizes).
-	for i := 0; i < len(sorted); i++ {
-		for j := i + 1; j < len(sorted); j++ {
-			if sorted[j].prob > sorted[i].prob {
-				sorted[i], sorted[j] = sorted[j], sorted[i]
-			}
-		}
-	}
-
-	// Accumulate probabilities until reaching top-p.
+	sort.Slice(sorted, func(i, j int) bool {
+		return sorted[i].prob > sorted[j].prob
+	})
 	var cumSum float32
 	for i := 0; i < len(sorted); i++ {
 		cumSum += sorted[i].prob
 		if cumSum >= topP {
-			// Sample uniformly from top-p indices.
 			return int32(sorted[rand.Intn(i+1)].idx)
 		}
 	}
 
 	// Fallback to highest probability.
 	return int32(sorted[0].idx)
-}
-
-// softmax computes softmax over logits.
-func (d *WhisperDecoder) softmax(logits []float32) []float32 {
-	maxLogit := logits[0]
-	for i := 1; i < len(logits); i++ {
-		if logits[i] > maxLogit {
-			maxLogit = logits[i]
-		}
-	}
-
-	probs := make([]float32, len(logits))
-	expSum := float32(0)
-	for i := range logits {
-		probs[i] = float32(math.Exp(float64(logits[i] - maxLogit)))
-		expSum += probs[i]
-	}
-
-	for i := range probs {
-		probs[i] /= expSum
-	}
-
-	return probs
 }
 
 // tokensToSegments converts a token sequence to segments.
@@ -1044,14 +1086,9 @@ func sortAndPruneBeams(candidates []*beamCandidate, k int) []*beamCandidate {
 		return []*beamCandidate{}
 	}
 
-	// Simple sorting (bubble sort for small sizes).
-	for i := 0; i < len(candidates); i++ {
-		for j := i + 1; j < len(candidates); j++ {
-			if candidates[j].normScore > candidates[i].normScore {
-				candidates[i], candidates[j] = candidates[j], candidates[i]
-			}
-		}
-	}
+	sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i].normScore > candidates[j].normScore
+	})
 
 	if k > len(candidates) {
 		k = len(candidates)

@@ -67,25 +67,35 @@ func fastExpApprox(x float32) float32 {
 //
 //	out:     [heads, T_q, head_dim]
 //	weights: [heads, T_q, T_k] if returnWeights is true, else zero Tensor
-func ScaledDotProductAttention(ctx context.Context, q, k, v Tensor, causal, returnWeights bool) (out Tensor, weights Tensor, err error) {
+func ScaledDotProductAttentionInto(ctx context.Context, q, k, v Tensor, causal bool, out, weights, scoresScratch Tensor) error {
 	if len(q.Shape) != 3 || len(k.Shape) != 3 || len(v.Shape) != 3 {
-		return Tensor{}, Tensor{}, fmt.Errorf("%w: attention: q/k/v must be 3D", ErrShapeMismatch)
+		return fmt.Errorf("%w: attention: q/k/v must be 3D", ErrShapeMismatch)
 	}
 	heads, Tq, headDim := q.Shape[0], q.Shape[1], q.Shape[2]
 	if k.Shape[0] != heads || v.Shape[0] != heads {
-		return Tensor{}, Tensor{}, fmt.Errorf("%w: attention: head count mismatch", ErrShapeMismatch)
+		return fmt.Errorf("%w: attention: head count mismatch", ErrShapeMismatch)
 	}
 	Tk := k.Shape[1]
 	if k.Shape[2] != headDim || v.Shape[1] != Tk || v.Shape[2] != headDim {
-		return Tensor{}, Tensor{}, fmt.Errorf("%w: attention: k/v shape mismatch", ErrShapeMismatch)
+		return fmt.Errorf("%w: attention: k/v shape mismatch", ErrShapeMismatch)
+	}
+
+	if len(out.Shape) != 3 || out.Shape[0] != heads || out.Shape[1] != Tq || out.Shape[2] != headDim {
+		return fmt.Errorf("%w: attention: out shape mismatch: got %v, want [%d %d %d]", ErrShapeMismatch, out.Shape, heads, Tq, headDim)
+	}
+
+	returnWeights := len(weights.Shape) != 0
+	if returnWeights {
+		if len(weights.Shape) != 3 || weights.Shape[0] != heads || weights.Shape[1] != Tq || weights.Shape[2] != Tk {
+			return fmt.Errorf("%w: attention: weights shape mismatch: got %v, want [%d %d %d]", ErrShapeMismatch, weights.Shape, heads, Tq, Tk)
+		}
+	}
+
+	if len(scoresScratch.Shape) != 3 || scoresScratch.Shape[0] != heads || scoresScratch.Shape[1] != Tq || scoresScratch.Shape[2] != Tk {
+		return fmt.Errorf("%w: attention: scores scratch shape mismatch: got %v, want [%d %d %d]", ErrShapeMismatch, scoresScratch.Shape, heads, Tq, Tk)
 	}
 
 	scale := float32(1.0 / math.Sqrt(float64(headDim)))
-	outTensor := New(heads, Tq, headDim)
-	var wTensor Tensor
-	if returnWeights {
-		wTensor = New(heads, Tq, Tk)
-	}
 
 	numCPU := runtime.NumCPU()
 	g, gctx := errgroup.WithContext(ctx)
@@ -102,17 +112,19 @@ func ScaledDotProductAttention(ctx context.Context, q, k, v Tensor, causal, retu
 			end = heads
 		}
 		g.Go(func() error {
-			scores := make([]float32, Tq*Tk)
 			for h := start; h < end; h++ {
 				if err := gctx.Err(); err != nil {
 					return err
 				}
+
 				qOff := h * Tq * headDim
 				kOff := h * Tk * headDim
 				vOff := h * Tk * headDim
 
-				// Fast path: use BLAS gemm for Q @ K^T
-				// Q: [Tq, headDim], K: [Tk, headDim] → scores: [Tq, Tk]
+				scoresOff := h * Tq * Tk
+				scores := scoresScratch.Data[scoresOff : scoresOff+Tq*Tk]
+
+				// Q: [Tq, headDim], K: [Tk, headDim] -> scores: [Tq, Tk]
 				qTensor := Tensor{Shape: []int{Tq, headDim}, Data: q.Data[qOff : qOff+Tq*headDim]}
 				kTensor := Tensor{Shape: []int{Tk, headDim}, Data: k.Data[kOff : kOff+Tk*headDim]}
 				scoresTensor := Tensor{Shape: []int{Tq, Tk}, Data: scores}
@@ -120,12 +132,11 @@ func ScaledDotProductAttention(ctx context.Context, q, k, v Tensor, causal, retu
 				if err != nil {
 					return err
 				}
-				// Apply scale
+
 				for i := range scores {
 					scores[i] *= scale
 				}
 
-				// causal mask: positions j > i get -inf
 				if causal {
 					for i := 0; i < Tq; i++ {
 						for j := i + 1; j < Tk; j++ {
@@ -134,7 +145,6 @@ func ScaledDotProductAttention(ctx context.Context, q, k, v Tensor, causal, retu
 					}
 				}
 
-				// softmax over last axis (Tk)
 				for i := 0; i < Tq; i++ {
 					row := scores[i*Tk : (i+1)*Tk]
 					maxVal := row[0]
@@ -143,6 +153,7 @@ func ScaledDotProductAttention(ctx context.Context, q, k, v Tensor, causal, retu
 							maxVal = val
 						}
 					}
+
 					var sum float32
 					if attentionUseFastExp {
 						for j := range row {
@@ -155,6 +166,7 @@ func ScaledDotProductAttention(ctx context.Context, q, k, v Tensor, causal, retu
 							sum += row[j]
 						}
 					}
+
 					if sum == 0 {
 						inv := 1.0 / float32(len(row))
 						for j := range row {
@@ -162,22 +174,20 @@ func ScaledDotProductAttention(ctx context.Context, q, k, v Tensor, causal, retu
 						}
 						continue
 					}
+					invSum := 1 / sum
 					for j := range row {
-						row[j] /= sum
+						row[j] *= invSum
 					}
 				}
 
 				if returnWeights {
-					wOff := h * Tq * Tk
-					copy(wTensor.Data[wOff:wOff+Tq*Tk], scores)
+					copy(weights.Data[scoresOff:scoresOff+Tq*Tk], scores)
 				}
 
-				// out[h] = scores @ V where:
-				// scores: [Tq, Tk], V: [Tk, headDim], out: [Tq, headDim]
 				outScoresTensor := Tensor{Shape: []int{Tq, Tk}, Data: scores}
 				vTensor := Tensor{Shape: []int{Tk, headDim}, Data: v.Data[vOff : vOff+Tk*headDim]}
-				oOff := h * Tq * headDim
-				headOut := Tensor{Shape: []int{Tq, headDim}, Data: outTensor.Data[oOff : oOff+Tq*headDim]}
+				outOff := h * Tq * headDim
+				headOut := Tensor{Shape: []int{Tq, headDim}, Data: out.Data[outOff : outOff+Tq*headDim]}
 				err = MatMulInto(gctx, outScoresTensor, vTensor, headOut)
 				if err != nil {
 					return err
@@ -186,8 +196,37 @@ func ScaledDotProductAttention(ctx context.Context, q, k, v Tensor, causal, retu
 			return nil
 		})
 	}
+
 	if err := g.Wait(); err != nil {
-		return Tensor{}, Tensor{}, fmt.Errorf("ml: attention: %w", err)
+		return fmt.Errorf("ml: attention: %w", err)
 	}
-	return outTensor, wTensor, nil
+
+	return nil
+}
+
+func ScaledDotProductAttention(ctx context.Context, q, k, v Tensor, causal, returnWeights bool) (out Tensor, weights Tensor, err error) {
+	if len(q.Shape) != 3 || len(k.Shape) != 3 || len(v.Shape) != 3 {
+		return Tensor{}, Tensor{}, fmt.Errorf("%w: attention: q/k/v must be 3D", ErrShapeMismatch)
+	}
+	heads, Tq, headDim := q.Shape[0], q.Shape[1], q.Shape[2]
+	if k.Shape[0] != heads || v.Shape[0] != heads {
+		return Tensor{}, Tensor{}, fmt.Errorf("%w: attention: head count mismatch", ErrShapeMismatch)
+	}
+	Tk := k.Shape[1]
+	if k.Shape[2] != headDim || v.Shape[1] != Tk || v.Shape[2] != headDim {
+		return Tensor{}, Tensor{}, fmt.Errorf("%w: attention: k/v shape mismatch", ErrShapeMismatch)
+	}
+
+	out = New(heads, Tq, headDim)
+	var w Tensor
+	if returnWeights {
+		w = New(heads, Tq, Tk)
+	}
+	scores := New(heads, Tq, Tk)
+
+	if err := ScaledDotProductAttentionInto(ctx, q, k, v, causal, out, w, scores); err != nil {
+		return Tensor{}, Tensor{}, err
+	}
+
+	return out, w, nil
 }

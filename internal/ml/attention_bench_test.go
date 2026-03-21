@@ -42,6 +42,21 @@ func BenchmarkScaledDotProductAttention_SoftmaxModes(b *testing.B) {
 		}
 	})
 
+	b.Run("exact_exp_into", func(b *testing.B) {
+		prev := SetFastSoftmaxEnabled(false)
+		defer SetFastSoftmaxEnabled(prev)
+		out := New(heads, tq, headDim)
+		scores := New(heads, tq, tk)
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			err := ScaledDotProductAttentionInto(ctx, q, k, v, false, out, Tensor{}, scores)
+			if err != nil {
+				b.Fatalf("attention into failed: %v", err)
+			}
+		}
+	})
+
 	b.Run("fast_exp", func(b *testing.B) {
 		prev := SetFastSoftmaxEnabled(true)
 		defer SetFastSoftmaxEnabled(prev)
@@ -51,6 +66,21 @@ func BenchmarkScaledDotProductAttention_SoftmaxModes(b *testing.B) {
 			_, _, err := ScaledDotProductAttention(ctx, q, k, v, false, false)
 			if err != nil {
 				b.Fatalf("attention failed: %v", err)
+			}
+		}
+	})
+
+	b.Run("fast_exp_into", func(b *testing.B) {
+		prev := SetFastSoftmaxEnabled(true)
+		defer SetFastSoftmaxEnabled(prev)
+		out := New(heads, tq, headDim)
+		scores := New(heads, tq, tk)
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			err := ScaledDotProductAttentionInto(ctx, q, k, v, false, out, Tensor{}, scores)
+			if err != nil {
+				b.Fatalf("attention into failed: %v", err)
 			}
 		}
 	})

@@ -5,6 +5,28 @@ import (
 	"math"
 )
 
+// AddInto computes dst = a + b for equal-shaped tensors.
+func AddInto(dst, a, b Tensor) error {
+	if !equalShapes(a.Shape, b.Shape) || !equalShapes(dst.Shape, a.Shape) {
+		return fmt.Errorf("%w: AddInto: dst=%v a=%v b=%v", ErrShapeMismatch, dst.Shape, a.Shape, b.Shape)
+	}
+	for i := range dst.Data {
+		dst.Data[i] = a.Data[i] + b.Data[i]
+	}
+	return nil
+}
+
+// AddInPlace performs dst += src for equal-shaped tensors.
+func AddInPlace(dst, src Tensor) error {
+	if !equalShapes(dst.Shape, src.Shape) {
+		return fmt.Errorf("%w: AddInPlace: dst=%v src=%v", ErrShapeMismatch, dst.Shape, src.Shape)
+	}
+	for i := range dst.Data {
+		dst.Data[i] += src.Data[i]
+	}
+	return nil
+}
+
 // Add adds two tensors element-wise. b is broadcast over the leading dimensions of a.
 func Add(a, b Tensor) Tensor {
 	return elementwise(a, b, func(x, y float32) float32 { return x + y })
@@ -49,6 +71,28 @@ func GELU(t Tensor) Tensor {
 	return out
 }
 
+// GELUInto applies GELU to src and writes into dst.
+func GELUInto(dst, src Tensor) error {
+	if !equalShapes(dst.Shape, src.Shape) {
+		return fmt.Errorf("%w: GELUInto: dst=%v src=%v", ErrShapeMismatch, dst.Shape, src.Shape)
+	}
+	const sqrt2OverPi = 0.7978845608028654
+	for i, x := range src.Data {
+		inner := sqrt2OverPi * (x + 0.044715*x*x*x)
+		dst.Data[i] = x * 0.5 * float32(1+math.Tanh(float64(inner)))
+	}
+	return nil
+}
+
+// GELUInPlace applies GELU in place.
+func GELUInPlace(t Tensor) {
+	const sqrt2OverPi = 0.7978845608028654
+	for i, x := range t.Data {
+		inner := sqrt2OverPi * (x + 0.044715*x*x*x)
+		t.Data[i] = x * 0.5 * float32(1+math.Tanh(float64(inner)))
+	}
+}
+
 // LayerNorm applies layer normalisation over the last dimension.
 // t shape [*, C], weight and bias shape [C].
 func LayerNorm(t, weight, bias Tensor, eps float32) Tensor {
@@ -74,6 +118,46 @@ func LayerNorm(t, weight, bias Tensor, eps float32) Tensor {
 		}
 	}
 	return out
+}
+
+// LayerNormInto applies layer normalization over the last dimension into dst.
+// t and dst must have the same shape. weight and bias must have shape [C].
+func LayerNormInto(dst, t, weight, bias Tensor, eps float32) error {
+	if !equalShapes(dst.Shape, t.Shape) {
+		return fmt.Errorf("%w: LayerNormInto: dst=%v t=%v", ErrShapeMismatch, dst.Shape, t.Shape)
+	}
+	if len(t.Shape) == 0 {
+		return fmt.Errorf("%w: LayerNormInto: t must have at least 1 dimension", ErrShapeMismatch)
+	}
+	C := t.Shape[len(t.Shape)-1]
+	if len(weight.Shape) != 1 || len(bias.Shape) != 1 || weight.Shape[0] != C || bias.Shape[0] != C {
+		return fmt.Errorf("%w: LayerNormInto: weight=%v bias=%v expected [%d]", ErrShapeMismatch, weight.Shape, bias.Shape, C)
+	}
+
+	rows := t.Size() / C
+	for r := 0; r < rows; r++ {
+		srcRow := t.Data[r*C : (r+1)*C]
+		dstRow := dst.Data[r*C : (r+1)*C]
+		var mean float32
+		for _, v := range srcRow {
+			mean += v
+		}
+		mean /= float32(C)
+
+		var vari float32
+		for _, v := range srcRow {
+			d := v - mean
+			vari += d * d
+		}
+		vari /= float32(C)
+
+		std := float32(math.Sqrt(float64(vari + eps)))
+		for i, v := range srcRow {
+			dstRow[i] = weight.Data[i]*(v-mean)/std + bias.Data[i]
+		}
+	}
+
+	return nil
 }
 
 // Softmax applies numerically stable softmax along the last axis.
