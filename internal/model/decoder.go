@@ -297,6 +297,91 @@ type decoderState struct {
 	logits      []float32    // Latest logits [nVocab]
 	kvCache     ml.Tensor    // [nLayer, 2, seqLen, nTextState]
 	cachedPos   int          // Number of positions cached
+	crossK      []ml.Tensor  // per-layer cached projected encoder K [encLen, nTextState]
+	crossV      []ml.Tensor  // per-layer cached projected encoder V [encLen, nTextState]
+	crossReady  []bool       // whether crossK/crossV are initialized for layer
+	scratch     decoderScratch
+}
+
+type decoderScratch struct {
+	x       ml.Tensor // [1, nTextState]
+	xln     ml.Tensor // [1, nTextState]
+	q       ml.Tensor // [1, nTextState]
+	k       ml.Tensor // [1, nTextState]
+	v       ml.Tensor // [1, nTextState]
+	out     ml.Tensor // [1, nTextState]
+	mlpH    ml.Tensor // [1, 4*nTextState]
+	kFull   ml.Tensor // [nHead, nTextCtx, headDim]
+	vFull   ml.Tensor // [nHead, nTextCtx, headDim]
+	logits  ml.Tensor // [1, nVocab]
+}
+
+func (d *WhisperDecoder) newDecoderState(prompt []int32) *decoderState {
+	state := &decoderState{
+		tokens:     make([]int32, len(prompt)),
+		kvCache:    ml.New(d.nTextLayer, 2, d.nTextCtx, d.nTextState),
+		cachedPos:  0,
+		crossK:     make([]ml.Tensor, d.nTextLayer),
+		crossV:     make([]ml.Tensor, d.nTextLayer),
+		crossReady: make([]bool, d.nTextLayer),
+	}
+	copy(state.tokens, prompt)
+
+	headDim := d.nTextState / d.nHead
+	state.scratch = decoderScratch{
+		x:      ml.New(1, d.nTextState),
+		xln:    ml.New(1, d.nTextState),
+		q:      ml.New(1, d.nTextState),
+		k:      ml.New(1, d.nTextState),
+		v:      ml.New(1, d.nTextState),
+		out:    ml.New(1, d.nTextState),
+		mlpH:   ml.New(1, 4*d.nTextState),
+		kFull:  ml.New(d.nHead, d.nTextCtx, headDim),
+		vFull:  ml.New(d.nHead, d.nTextCtx, headDim),
+		logits: ml.New(1, d.nVocab),
+	}
+
+	return state
+}
+
+func addInPlace(dst, src ml.Tensor) {
+	for i := range dst.Data {
+		dst.Data[i] += src.Data[i]
+	}
+}
+
+func addBiasRowInPlace(dst, bias ml.Tensor) {
+	for i := range bias.Data {
+		dst.Data[i] += bias.Data[i]
+	}
+}
+
+func geluInPlace(dst ml.Tensor) {
+	const sqrt2OverPi = 0.7978845608028654
+	for i, x := range dst.Data {
+		inner := sqrt2OverPi * (x + 0.044715*x*x*x)
+		dst.Data[i] = x * 0.5 * float32(1+math.Tanh(float64(inner)))
+	}
+}
+
+func layerNormRowInto(src, weight, bias, out ml.Tensor, eps float32) {
+	C := src.Shape[len(src.Shape)-1]
+	row := src.Data[:C]
+	var mean float32
+	for _, v := range row {
+		mean += v
+	}
+	mean /= float32(C)
+	var vari float32
+	for _, v := range row {
+		d := v - mean
+		vari += d * d
+	}
+	vari /= float32(C)
+	std := float32(math.Sqrt(float64(vari + eps)))
+	for i, v := range row {
+		out.Data[i] = weight.Data[i]*(v-mean)/std + bias.Data[i]
+	}
 }
 
 // Decode generates token sequences using greedy or beam search.
@@ -313,12 +398,7 @@ func (d *WhisperDecoder) Decode(ctx context.Context, encoderOut ml.Tensor, param
 
 // decodeGreedy uses greedy sampling to generate tokens.
 func (d *WhisperDecoder) decodeGreedy(ctx context.Context, encoderOut ml.Tensor, params DecoderParams) ([]Segment, error) {
-	state := &decoderState{
-		tokens:    make([]int32, len(params.Prompt)),
-		kvCache:   ml.New(d.nTextLayer, 2, d.nTextCtx, d.nTextState),
-		cachedPos: 0,
-	}
-	copy(state.tokens, params.Prompt)
+	state := d.newDecoderState(params.Prompt)
 
 	temperature := params.Temperature
 	if temperature == 0 {
@@ -417,11 +497,8 @@ func (d *WhisperDecoder) decodeBeamSearch(ctx context.Context, encoderOut ml.Ten
 				continue
 			}
 
-			state := &decoderState{
-				tokens:    hyp.tokens,
-				kvCache:   ml.New(d.nTextLayer, 2, d.nTextCtx, d.nTextState),
-				cachedPos: 0,
-			}
+			state := d.newDecoderState(nil)
+			state.tokens = hyp.tokens
 
 			logits, err := d.forward(ctx, state, encoderOut)
 			if err != nil {
@@ -518,18 +595,13 @@ func (d *WhisperDecoder) forward(ctx context.Context, state *decoderState, encod
 		return nil, fmt.Errorf("model: decode: forward: token embedding out of bounds")
 	}
 
-	// x = token_embedding + positional_embedding [nTextState]
-	x := ml.New(d.nTextState)
+	// x = token_embedding + positional_embedding [1, nTextState]
+	x := state.scratch.x
 	copy(x.Data, d.tokenEmb.Data[startIdx:endIdx])
-
 	posStartIdx := nextPos * d.nTextState
 	for i := 0; i < d.nTextState; i++ {
 		x.Data[i] += d.posEmb.Data[posStartIdx+i]
 	}
-
-	// Reshape x to [1, nTextState] for batch processing.
-	x = ml.New(1, d.nTextState)
-	copy(x.Data, x.Data[:d.nTextState])
 
 	headDim := d.nTextState / d.nHead
 
@@ -538,28 +610,29 @@ func (d *WhisperDecoder) forward(ctx context.Context, state *decoderState, encod
 		b := &d.blocks[i]
 
 		// Self-attention with KV cache.
-		xln := ml.LayerNorm(x, b.sAttnLnW, b.sAttnLnB, layerNormEps)
-		attnOut, err := d.runDecoderSelfAttn(ctx, xln, b.selfAttn, nextPos, state.kvCache, i, headDim)
+		xln := state.scratch.xln
+		layerNormRowInto(x, b.sAttnLnW, b.sAttnLnB, xln, layerNormEps)
+		attnOut, err := d.runDecoderSelfAttn(ctx, state, xln, b.selfAttn, nextPos, i, headDim)
 		if err != nil {
 			return nil, fmt.Errorf("model: decode: block %d self_attn: %w", i, err)
 		}
-		x = ml.Add(x, attnOut)
+		addInPlace(x, attnOut)
 
 		// Cross-attention to encoder output.
-		xln = ml.LayerNorm(x, b.cAttnLnW, b.cAttnLnB, layerNormEps)
-		crossOut, err := d.runDecoderCrossAttn(ctx, xln, encoderOut, b.crossAttn, headDim)
+		layerNormRowInto(x, b.cAttnLnW, b.cAttnLnB, xln, layerNormEps)
+		crossOut, err := d.runDecoderCrossAttn(ctx, state, xln, encoderOut, b.crossAttn, i, headDim)
 		if err != nil {
 			return nil, fmt.Errorf("model: decode: block %d cross_attn: %w", i, err)
 		}
-		x = ml.Add(x, crossOut)
+		addInPlace(x, crossOut)
 
 		// MLP sub-layer.
-		xln = ml.LayerNorm(x, b.mlpLnW, b.mlpLnB, layerNormEps)
-		mlpOut, err := d.runMLP(ctx, xln, b)
+		layerNormRowInto(x, b.mlpLnW, b.mlpLnB, xln, layerNormEps)
+		mlpOut, err := d.runMLP(ctx, state, xln, b)
 		if err != nil {
 			return nil, fmt.Errorf("model: decode: block %d mlp: %w", i, err)
 		}
-		x = ml.Add(x, mlpOut)
+		addInPlace(x, mlpOut)
 
 		if err := ctx.Err(); err != nil {
 			return nil, fmt.Errorf("model: decode: cancelled after block %d: %w", i, err)
@@ -567,13 +640,13 @@ func (d *WhisperDecoder) forward(ctx context.Context, state *decoderState, encod
 	}
 
 	// Final layer norm.
-	x = ml.LayerNorm(x, d.lnW, d.lnB, layerNormEps)
+	layerNormRowInto(x, d.lnW, d.lnB, x, layerNormEps)
 
 	// Project to vocabulary: x @ tokenEmb^T → [1, nVocab]
-	logits, err := ml.MatMulTransB(ctx, x, d.tokenEmb)
-	if err != nil {
+	if err := ml.MatMulTransBInto(ctx, x, d.tokenEmb, state.scratch.logits); err != nil {
 		return nil, fmt.Errorf("model: decode: forward: logits: %w", err)
 	}
+	logits := state.scratch.logits
 
 	if len(logits.Shape) != 2 || logits.Shape[0] != 1 || logits.Shape[1] != d.nVocab {
 		return nil, fmt.Errorf("model: decode: forward: logits shape mismatch: %v", logits.Shape)
@@ -583,30 +656,29 @@ func (d *WhisperDecoder) forward(ctx context.Context, state *decoderState, encod
 }
 
 // runDecoderSelfAttn runs causal self-attention with KV cache.
-func (d *WhisperDecoder) runDecoderSelfAttn(ctx context.Context, x ml.Tensor, attn decoderSelfAttn, pos int, kvCache ml.Tensor, layerIdx, headDim int) (ml.Tensor, error) {
+func (d *WhisperDecoder) runDecoderSelfAttn(ctx context.Context, state *decoderState, x ml.Tensor, attn decoderSelfAttn, pos int, layerIdx, headDim int) (ml.Tensor, error) {
 	if len(x.Shape) != 2 || x.Shape[1] != d.nTextState {
 		return ml.Tensor{}, fmt.Errorf("model: decode: self_attn: x shape mismatch")
 	}
+	kvCache := state.kvCache
+	sc := &state.scratch
 
 	// Compute Q: x @ qW^T + qB → [1, nTextState]
-	q, err := ml.MatMulTransB(ctx, x, attn.qW)
-	if err != nil {
+	if err := ml.MatMulTransBInto(ctx, x, attn.qW, sc.q); err != nil {
 		return ml.Tensor{}, fmt.Errorf("model: decode: self_attn: q matmul: %w", err)
 	}
-	q = ml.Add(q, attn.qB)
+	addBiasRowInPlace(sc.q, attn.qB)
 
 	// Compute K: x @ kW^T → [1, nTextState]
-	k, err := ml.MatMulTransB(ctx, x, attn.kW)
-	if err != nil {
+	if err := ml.MatMulTransBInto(ctx, x, attn.kW, sc.k); err != nil {
 		return ml.Tensor{}, fmt.Errorf("model: decode: self_attn: k matmul: %w", err)
 	}
 
 	// Compute V: x @ vW^T + vB → [1, nTextState]
-	v, err := ml.MatMulTransB(ctx, x, attn.vW)
-	if err != nil {
+	if err := ml.MatMulTransBInto(ctx, x, attn.vW, sc.v); err != nil {
 		return ml.Tensor{}, fmt.Errorf("model: decode: self_attn: v matmul: %w", err)
 	}
-	v = ml.Add(v, attn.vB)
+	addBiasRowInPlace(sc.v, attn.vB)
 
 	// Update KV cache with new K and V.
 	// kvCache shape: [nLayer, 2, nTextCtx, nTextState]
@@ -615,14 +687,14 @@ func (d *WhisperDecoder) runDecoderSelfAttn(ctx context.Context, x ml.Tensor, at
 	nTextState := d.nTextState
 	kCacheOff := layerIdx*2*nTextCtx*nTextState + 0*nTextCtx*nTextState + pos*nTextState
 	vCacheOff := layerIdx*2*nTextCtx*nTextState + 1*nTextCtx*nTextState + pos*nTextState
-	copy(kvCache.Data[kCacheOff:kCacheOff+nTextState], k.Data)
-	copy(kvCache.Data[vCacheOff:vCacheOff+nTextState], v.Data)
+	copy(kvCache.Data[kCacheOff:kCacheOff+nTextState], sc.k.Data)
+	copy(kvCache.Data[vCacheOff:vCacheOff+nTextState], sc.v.Data)
 
 	// Retrieve accumulated K and V up to pos+1.
 	// We need [nHead, pos+1, headDim] for both.
 	seqLen := pos + 1
-	kFull := ml.New(d.nHead, seqLen, headDim)
-	vFull := ml.New(d.nHead, seqLen, headDim)
+	kFull := ml.From(sc.kFull.Data[:d.nHead*seqLen*headDim], d.nHead, seqLen, headDim)
+	vFull := ml.From(sc.vFull.Data[:d.nHead*seqLen*headDim], d.nHead, seqLen, headDim)
 
 	kLayerOff := layerIdx * 2 * nTextCtx * nTextState
 	vLayerOff := layerIdx*2*nTextCtx*nTextState + 1*nTextCtx*nTextState
@@ -640,7 +712,7 @@ func (d *WhisperDecoder) runDecoderSelfAttn(ctx context.Context, x ml.Tensor, at
 	}
 
 	// Reshape Q for attention: [nHead, 1, headDim]
-	q = q.Reshape(d.nHead, 1, headDim)
+	q := ml.From(sc.q.Data, d.nHead, 1, headDim)
 
 	// Apply scaled dot-product attention (causal).
 	attnOut, _, err := ml.ScaledDotProductAttention(ctx, q, kFull, vFull, true, false)
@@ -653,47 +725,54 @@ func (d *WhisperDecoder) runDecoderSelfAttn(ctx context.Context, x ml.Tensor, at
 	attnOut = attnOut.Reshape(1, d.nHead*headDim)
 
 	// Project output: attnOut @ outW^T + outB → [1, nTextState]
-	out, err := ml.MatMulTransB(ctx, attnOut, attn.outW)
-	if err != nil {
+	if err := ml.MatMulTransBInto(ctx, attnOut, attn.outW, sc.out); err != nil {
 		return ml.Tensor{}, fmt.Errorf("model: decode: self_attn: out matmul: %w", err)
 	}
-	out = ml.Add(out, attn.outB)
+	addBiasRowInPlace(sc.out, attn.outB)
 
-	return out, nil
+	return sc.out, nil
 }
 
 // runDecoderCrossAttn runs cross-attention to encoder output.
-func (d *WhisperDecoder) runDecoderCrossAttn(ctx context.Context, x, encoderOut ml.Tensor, attn decoderCrossAttn, headDim int) (ml.Tensor, error) {
+func (d *WhisperDecoder) runDecoderCrossAttn(ctx context.Context, state *decoderState, x, encoderOut ml.Tensor, attn decoderCrossAttn, layerIdx, headDim int) (ml.Tensor, error) {
 	if len(x.Shape) != 2 || x.Shape[1] != d.nTextState {
 		return ml.Tensor{}, fmt.Errorf("model: decode: cross_attn: x shape mismatch")
 	}
+	sc := &state.scratch
 
 	// Compute Q: x @ qW^T + qB → [1, nTextState]
-	q, err := ml.MatMulTransB(ctx, x, attn.qW)
-	if err != nil {
+	if err := ml.MatMulTransBInto(ctx, x, attn.qW, sc.q); err != nil {
 		return ml.Tensor{}, fmt.Errorf("model: decode: cross_attn: q matmul: %w", err)
 	}
-	q = ml.Add(q, attn.qB)
+	addBiasRowInPlace(sc.q, attn.qB)
 
-	// Compute K from encoder output: encoderOut @ kW^T → [encLen, nTextState]
-	k, err := ml.MatMulTransB(ctx, encoderOut, attn.kW)
-	if err != nil {
-		return ml.Tensor{}, fmt.Errorf("model: decode: cross_attn: k matmul: %w", err)
+	if !state.crossReady[layerIdx] {
+		encLen := encoderOut.Shape[0]
+		state.crossK[layerIdx] = ml.New(encLen, d.nTextState)
+		state.crossV[layerIdx] = ml.New(encLen, d.nTextState)
+		if err := ml.MatMulTransBInto(ctx, encoderOut, attn.kW, state.crossK[layerIdx]); err != nil {
+			return ml.Tensor{}, fmt.Errorf("model: decode: cross_attn: k matmul: %w", err)
+		}
+		if err := ml.MatMulTransBInto(ctx, encoderOut, attn.vW, state.crossV[layerIdx]); err != nil {
+			return ml.Tensor{}, fmt.Errorf("model: decode: cross_attn: v matmul: %w", err)
+		}
+		for i := 0; i < encLen; i++ {
+			base := i * d.nTextState
+			for j := 0; j < d.nTextState; j++ {
+				state.crossV[layerIdx].Data[base+j] += attn.vB.Data[j]
+			}
+		}
+		state.crossReady[layerIdx] = true
 	}
-
-	// Compute V from encoder output: encoderOut @ vW^T + vB → [encLen, nTextState]
-	v, err := ml.MatMulTransB(ctx, encoderOut, attn.vW)
-	if err != nil {
-		return ml.Tensor{}, fmt.Errorf("model: decode: cross_attn: v matmul: %w", err)
-	}
-	v = ml.Add(v, attn.vB)
+	k := state.crossK[layerIdx]
+	v := state.crossV[layerIdx]
 
 	// Reshape for attention: Q [nHead, 1, headDim], K/V [nHead, encLen, headDim]
 	encLen := len(k.Data) / d.nTextState
 	if encLen <= 0 || encLen*d.nTextState != len(k.Data) {
 		return ml.Tensor{}, fmt.Errorf("model: decode: cross_attn: k shape inconsistent with nTextState")
 	}
-	q = q.Reshape(d.nHead, 1, headDim)
+	q := ml.From(sc.q.Data, d.nHead, 1, headDim)
 	k = k.Reshape(d.nHead, encLen, headDim)
 	v = v.Reshape(d.nHead, encLen, headDim)
 
@@ -708,37 +787,35 @@ func (d *WhisperDecoder) runDecoderCrossAttn(ctx context.Context, x, encoderOut 
 	attnOut = attnOut.Reshape(1, d.nHead*headDim)
 
 	// Project output: attnOut @ outW^T + outB → [1, nTextState]
-	out, err := ml.MatMulTransB(ctx, attnOut, attn.outW)
-	if err != nil {
+	if err := ml.MatMulTransBInto(ctx, attnOut, attn.outW, sc.out); err != nil {
 		return ml.Tensor{}, fmt.Errorf("model: decode: cross_attn: out matmul: %w", err)
 	}
-	out = ml.Add(out, attn.outB)
+	addBiasRowInPlace(sc.out, attn.outB)
 
-	return out, nil
+	return sc.out, nil
 }
 
 // runMLP runs the MLP sub-layer.
-func (d *WhisperDecoder) runMLP(ctx context.Context, x ml.Tensor, b *decoderBlock) (ml.Tensor, error) {
+func (d *WhisperDecoder) runMLP(ctx context.Context, state *decoderState, x ml.Tensor, b *decoderBlock) (ml.Tensor, error) {
 	if len(x.Shape) != 2 || x.Shape[1] != d.nTextState {
 		return ml.Tensor{}, fmt.Errorf("model: decode: mlp: x shape mismatch")
 	}
+	sc := &state.scratch
 
 	// MLP.0: x @ mlp0W^T + mlp0B → [1, 4*nTextState]
-	out, err := ml.MatMulTransB(ctx, x, b.mlp0W)
-	if err != nil {
+	if err := ml.MatMulTransBInto(ctx, x, b.mlp0W, sc.mlpH); err != nil {
 		return ml.Tensor{}, fmt.Errorf("model: decode: mlp.0: %w", err)
 	}
-	out = ml.Add(out, b.mlp0B)
-	out = ml.GELU(out)
+	addBiasRowInPlace(sc.mlpH, b.mlp0B)
+	geluInPlace(sc.mlpH)
 
 	// MLP.2: out @ mlp2W^T + mlp2B → [1, nTextState]
-	out, err = ml.MatMulTransB(ctx, out, b.mlp2W)
-	if err != nil {
+	if err := ml.MatMulTransBInto(ctx, sc.mlpH, b.mlp2W, sc.out); err != nil {
 		return ml.Tensor{}, fmt.Errorf("model: decode: mlp.2: %w", err)
 	}
-	out = ml.Add(out, b.mlp2B)
+	addBiasRowInPlace(sc.out, b.mlp2B)
 
-	return out, nil
+	return sc.out, nil
 }
 
 // sampleGreedy samples the next token using greedy sampling with temperature and fallback.

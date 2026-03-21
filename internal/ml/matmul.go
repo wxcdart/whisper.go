@@ -13,7 +13,12 @@ import (
 func MatMul(ctx context.Context, a, b Tensor) (Tensor, error) {
 	switch {
 	case len(a.Shape) == 2 && len(b.Shape) == 2:
-		return matmul2D(ctx, a, b, false)
+		M, N := a.Shape[0], b.Shape[1]
+		c := New(M, N)
+		if err := matmul2DInto(ctx, a, b, false, c); err != nil {
+			return Tensor{}, err
+		}
+		return c, nil
 	case len(a.Shape) == 3 && len(b.Shape) == 3:
 		return matmulBatched(ctx, a, b, false)
 	default:
@@ -26,7 +31,12 @@ func MatMul(ctx context.Context, a, b Tensor) (Tensor, error) {
 func MatMulTransB(ctx context.Context, a, b Tensor) (Tensor, error) {
 	switch {
 	case len(a.Shape) == 2 && len(b.Shape) == 2:
-		return matmul2D(ctx, a, b, true)
+		M, N := a.Shape[0], b.Shape[0]
+		c := New(M, N)
+		if err := matmul2DInto(ctx, a, b, true, c); err != nil {
+			return Tensor{}, err
+		}
+		return c, nil
 	case len(a.Shape) == 3 && len(b.Shape) == 3:
 		return matmulBatched(ctx, a, b, true)
 	default:
@@ -34,10 +44,26 @@ func MatMulTransB(ctx context.Context, a, b Tensor) (Tensor, error) {
 	}
 }
 
-// matmul2D handles the 2-D case, optionally treating B as transposed.
-func matmul2D(ctx context.Context, a, b Tensor, transB bool) (Tensor, error) {
+// MatMulInto computes out = A @ B for 2-D tensors without allocating output.
+func MatMulInto(ctx context.Context, a, b, out Tensor) error {
+	if len(a.Shape) != 2 || len(b.Shape) != 2 || len(out.Shape) != 2 {
+		return fmt.Errorf("%w: MatMulInto: a=%v b=%v out=%v", ErrShapeMismatch, a.Shape, b.Shape, out.Shape)
+	}
+	return matmul2DInto(ctx, a, b, false, out)
+}
+
+// MatMulTransBInto computes out = A @ B^T for 2-D tensors without allocating output.
+func MatMulTransBInto(ctx context.Context, a, b, out Tensor) error {
+	if len(a.Shape) != 2 || len(b.Shape) != 2 || len(out.Shape) != 2 {
+		return fmt.Errorf("%w: MatMulTransBInto: a=%v b=%v out=%v", ErrShapeMismatch, a.Shape, b.Shape, out.Shape)
+	}
+	return matmul2DInto(ctx, a, b, true, out)
+}
+
+// matmul2DInto handles the 2-D case, optionally treating B as transposed, writing into out.
+func matmul2DInto(ctx context.Context, a, b Tensor, transB bool, out Tensor) error {
 	if err := ctx.Err(); err != nil {
-		return Tensor{}, err
+		return err
 	}
 	M, K := a.Shape[0], a.Shape[1]
 	var N int
@@ -49,28 +75,31 @@ func matmul2D(ctx context.Context, a, b Tensor, transB bool) (Tensor, error) {
 		// the NON-transposed matrix.
 		N = b.Shape[0]
 		if b.Shape[1] != K {
-			return Tensor{}, fmt.Errorf("%w: matmul2D transB: a K=%d != b cols=%d", ErrShapeMismatch, K, b.Shape[1])
+			return fmt.Errorf("%w: matmul2D transB: a K=%d != b cols=%d", ErrShapeMismatch, K, b.Shape[1])
 		}
 		tB = blas.Trans
 		bGeneral = blas32.General{Rows: N, Cols: K, Data: b.Data, Stride: K}
 	} else {
 		// b is [K, N]
 		if b.Shape[0] != K {
-			return Tensor{}, fmt.Errorf("%w: matmul2D: a K=%d != b rows=%d", ErrShapeMismatch, K, b.Shape[0])
+			return fmt.Errorf("%w: matmul2D: a K=%d != b rows=%d", ErrShapeMismatch, K, b.Shape[0])
 		}
 		N = b.Shape[1]
 		bGeneral = blas32.General{Rows: K, Cols: N, Data: b.Data, Stride: N}
 	}
-	c := New(M, N)
+
+	if out.Shape[0] != M || out.Shape[1] != N {
+		return fmt.Errorf("%w: matmul2DInto out shape: got %v want [%d %d]", ErrShapeMismatch, out.Shape, M, N)
+	}
 
 	blas32.Gemm(blas.NoTrans, tB, 1,
 		blas32.General{Rows: M, Cols: K, Data: a.Data, Stride: K},
 		bGeneral,
 		0,
-		blas32.General{Rows: M, Cols: N, Data: c.Data, Stride: N},
+		blas32.General{Rows: M, Cols: N, Data: out.Data, Stride: N},
 	)
 
-	return c, nil
+	return nil
 }
 
 // matmulBatched handles the 3-D batched case, optionally treating B as transposed.

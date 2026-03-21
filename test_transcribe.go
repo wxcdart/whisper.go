@@ -1,3 +1,4 @@
+//go:build ignore
 // +build ignore
 
 package main
@@ -38,7 +39,7 @@ func main() {
 		log.Fatalf("Error transcribing: %v", err)
 	}
 	fmt.Printf("Transcription completed in %v\n", time.Since(start))
-	
+
 	fmt.Println("\nResult:")
 	for i, seg := range result.Segments {
 		fmt.Printf("[%d] %q\n", i, seg.Text)

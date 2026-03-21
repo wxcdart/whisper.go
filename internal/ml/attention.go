@@ -9,6 +9,52 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
+// attentionUseFastExp controls whether attention softmax uses the fast exp path.
+// It defaults to true for performance and can be toggled in benchmarks/tests.
+var attentionUseFastExp = true
+
+// SetFastSoftmaxEnabled toggles the fast-exp softmax implementation used by attention.
+// It returns the previous value.
+func SetFastSoftmaxEnabled(enabled bool) (previous bool) {
+	previous = attentionUseFastExp
+	attentionUseFastExp = enabled
+	return previous
+}
+
+const (
+	invLn2 float32 = 1.4426950408889634 // 1/ln(2)
+	ln2    float32 = 0.6931471805599453
+)
+
+func fastExpApprox(x float32) float32 {
+	// Softmax uses x <= 0 (after subtracting max); large negative values are effectively zero.
+	if x <= -20 {
+		return 0
+	}
+
+	y := x * invLn2
+	k := int(y)
+	if float32(k) > y {
+		k--
+	}
+	r := x - float32(k)*ln2
+
+	// 4th-order polynomial for exp(r) on [0, ln2).
+	r2 := r * r
+	r3 := r2 * r
+	r4 := r3 * r
+	poly := 1 + r + 0.5*r2 + (1.0/6.0)*r3 + (1.0/24.0)*r4
+
+	if k < -126 {
+		return 0
+	}
+	if k > 127 {
+		return math.MaxFloat32
+	}
+	twoPowK := math.Float32frombits(uint32(k+127) << 23)
+	return poly * twoPowK
+}
+
 // ScaledDotProductAttention computes Attention(Q, K, V) with optional causal masking.
 //
 // Shapes:
@@ -69,11 +115,11 @@ func ScaledDotProductAttention(ctx context.Context, q, k, v Tensor, causal, retu
 				// Q: [Tq, headDim], K: [Tk, headDim] → scores: [Tq, Tk]
 				qTensor := Tensor{Shape: []int{Tq, headDim}, Data: q.Data[qOff : qOff+Tq*headDim]}
 				kTensor := Tensor{Shape: []int{Tk, headDim}, Data: k.Data[kOff : kOff+Tk*headDim]}
-				scoresTensor, err := MatMulTransB(ctx, qTensor, kTensor)
+				scoresTensor := Tensor{Shape: []int{Tq, Tk}, Data: scores}
+				err := MatMulTransBInto(gctx, qTensor, kTensor, scoresTensor)
 				if err != nil {
 					return err
 				}
-				copy(scores, scoresTensor.Data)
 				// Apply scale
 				for i := range scores {
 					scores[i] *= scale
@@ -98,9 +144,23 @@ func ScaledDotProductAttention(ctx context.Context, q, k, v Tensor, causal, retu
 						}
 					}
 					var sum float32
-					for j := range row {
-						row[j] = float32(math.Exp(float64(row[j] - maxVal)))
-						sum += row[j]
+					if attentionUseFastExp {
+						for j := range row {
+							row[j] = fastExpApprox(row[j] - maxVal)
+							sum += row[j]
+						}
+					} else {
+						for j := range row {
+							row[j] = float32(math.Exp(float64(row[j] - maxVal)))
+							sum += row[j]
+						}
+					}
+					if sum == 0 {
+						inv := 1.0 / float32(len(row))
+						for j := range row {
+							row[j] = inv
+						}
+						continue
 					}
 					for j := range row {
 						row[j] /= sum
@@ -114,14 +174,14 @@ func ScaledDotProductAttention(ctx context.Context, q, k, v Tensor, causal, retu
 
 				// out[h] = scores @ V where:
 				// scores: [Tq, Tk], V: [Tk, headDim], out: [Tq, headDim]
-				scoresTensor := Tensor{Shape: []int{Tq, Tk}, Data: scores}
+				outScoresTensor := Tensor{Shape: []int{Tq, Tk}, Data: scores}
 				vTensor := Tensor{Shape: []int{Tk, headDim}, Data: v.Data[vOff : vOff+Tk*headDim]}
-				headOut, err := MatMul(gctx, scoresTensor, vTensor)
+				oOff := h * Tq * headDim
+				headOut := Tensor{Shape: []int{Tq, headDim}, Data: outTensor.Data[oOff : oOff+Tq*headDim]}
+				err = MatMulInto(gctx, outScoresTensor, vTensor, headOut)
 				if err != nil {
 					return err
 				}
-				oOff := h * Tq * headDim
-				copy(outTensor.Data[oOff:oOff+Tq*headDim], headOut.Data)
 			}
 			return nil
 		})
