@@ -1,12 +1,12 @@
 # whisper.go
 
-A pure-Go port of [whisper.cpp](https://github.com/ggerganov/whisper.cpp) with feature parity and zero CGo dependencies.
+A Go-native port of [whisper.cpp](https://github.com/ggerganov/whisper.cpp) with feature parity, zero CGo, and SIMD acceleration via `gonum`.
 
 **Status:** ✅ Feature-complete and ready for testing with real GGUF models.
 
 ## Features
 
-- ✅ **Pure Go** — No C bindings, no CGo, single statically-linked binary
+- ✅ **Go-native (no CGo)** — No C bindings, no CGo, single statically-linked binary
 - ✅ **Full pipeline** — Audio → mel-spectrogram → encoder → decoder → text
 - ✅ **Model format** — Complete GGUF v3 parser and writer
 - ✅ **Transformer models** — Self-attention, cross-attention, layer norm, GELU
@@ -169,7 +169,7 @@ See `TEST.md` for integration testing details.
 - **Uber Go Style** — No `init()`, error wrapping, table-driven tests
 - **SOLID Design** — Interfaces for extensibility (Encoder, Decoder, Formatter, VAD, Aligner)
 - **Context-aware** — All long-running operations respect `context.Context` for cancellation
-- **Pure Go** — No CGo, no C dependencies, single self-contained binary
+- **No CGo/C bindings** — Single self-contained binary with no C dependencies
 - **Minimal Dependencies** — Only `golang.org/x/sync` and `gonum.org/v1/gonum`
 
 ## Performance

@@ -6,7 +6,7 @@
 
 - **Language:** Go 1.25.0
 - **Model Format:** GGUF (including support for quantized types like `Q4_0`, `Q4_1`, `Q5_0`, `Q5_1`, `Q8_0`).
-- **Architecture:** Pure Go implementation of ML kernels and transcription pipeline, leveraging `errgroup` for parallelization.
+- **Architecture:** Go-native implementation of ML kernels and transcription pipeline (no CGo/C bindings), leveraging `errgroup` for parallelization and `gonum` BLAS SIMD kernels.
 - **Key Features:**
     - GGUF parser and dequantizer.
     - Audio processing (WAV reading, Log-mel spectrogram).

@@ -2,7 +2,7 @@
 
 ## Project
 
-`whisper.go` is a **pure Go port of [ggml-org/whisper.cpp](https://github.com/ggml-org/whisper.cpp)** — an automatic speech recognition (ASR) library implementing OpenAI's Whisper model. No CGo. No external C libraries. All tensor math, audio processing, and model inference in Go.
+`whisper.go` is a **Go-native port of [ggml-org/whisper.cpp](https://github.com/ggml-org/whisper.cpp)** — an automatic speech recognition (ASR) library implementing OpenAI's Whisper model. No CGo. No external C libraries. Tensor math, audio processing, and model inference are implemented in Go with SIMD acceleration via `gonum` BLAS.
 
 ## Build & Test
 
