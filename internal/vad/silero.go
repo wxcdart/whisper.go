@@ -45,7 +45,7 @@ type lstmState struct {
 }
 
 // NewVAD loads a Silero VAD model from a GGUF file.
-func NewVAD(ctx context.Context, f *gguf.File) (*SileroVAD, error) {
+func NewVAD(ctx context.Context, f gguf.FileLike) (*SileroVAD, error) {
 	vad := &SileroVAD{}
 
 	// Load hyperparameters from metadata

@@ -29,6 +29,25 @@ type File struct {
 	dataStart   int64
 }
 
+// FileLike is an interface abstraction over parsed model files.
+// It is implemented by *File (GGUF) and can be implemented by other
+// format adapters (e.g., legacy ggml .bin) to allow the rest of the
+// codebase to operate against a common API without depending on the
+// concrete GGUF struct.
+type FileLike interface {
+	Meta(key string) (any, bool)
+	MetaString(key string) (string, bool)
+	MetaUint32(key string) (uint32, bool)
+	MetaFloat32(key string) (float32, bool)
+	MetaStrings(key string) ([]string, bool)
+	MetaUint32s(key string) ([]uint32, bool)
+	TensorNames() []string
+	Tensor(ctx context.Context, name string) ([]float32, []int, error)
+	TensorRaw(ctx context.Context, name string) ([]byte, []int, QuantType, error)
+	TensorType(name string) (QuantType, bool)
+	Close() error
+}
+
 // Open parses a GGUF file and returns a File ready to read metadata and tensors.
 func Open(ctx context.Context, path string) (*File, error) {
 	f, err := os.Open(path)

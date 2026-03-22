@@ -12,7 +12,7 @@ import (
 
 const whisperHeadDim = 64
 
-func resolveTensorName(f *gguf.File, name string) (string, bool) {
+func resolveTensorName(f gguf.FileLike, name string) (string, bool) {
 	if _, ok := f.TensorType(name); ok {
 		return name, true
 	}
@@ -160,7 +160,7 @@ func parseIndexedSuffix(name, prefix string) (int, string, bool) {
 	return i, parts[1], true
 }
 
-func getMetaAny(f *gguf.File, keys ...string) (uint32, bool) {
+func getMetaAny(f gguf.FileLike, keys ...string) (uint32, bool) {
 	for _, k := range keys {
 		if v, ok := f.MetaUint32(k); ok {
 			return v, true
@@ -169,7 +169,7 @@ func getMetaAny(f *gguf.File, keys ...string) (uint32, bool) {
 	return 0, false
 }
 
-func inferLayerCount(f *gguf.File, sampleNameFmt string) (int, bool) {
+func inferLayerCount(f gguf.FileLike, sampleNameFmt string) (int, bool) {
 	count := 0
 	for {
 		name := fmt.Sprintf(sampleNameFmt, count)
@@ -184,7 +184,7 @@ func inferLayerCount(f *gguf.File, sampleNameFmt string) (int, bool) {
 	return count, true
 }
 
-func loadTensorShape(ctx context.Context, f *gguf.File, name string) ([]int, error) {
+func loadTensorShape(ctx context.Context, f gguf.FileLike, name string) ([]int, error) {
 	resolved, ok := resolveTensorName(f, name)
 	if !ok {
 		return nil, fmt.Errorf("model: load tensor %q: not found", name)
@@ -196,7 +196,7 @@ func loadTensorShape(ctx context.Context, f *gguf.File, name string) ([]int, err
 	return shape, nil
 }
 
-func loadTensorAuto(ctx context.Context, f *gguf.File, name string) (ml.Tensor, string, error) {
+func loadTensorAuto(ctx context.Context, f gguf.FileLike, name string) (ml.Tensor, string, error) {
 	resolved, ok := resolveTensorName(f, name)
 	if !ok {
 		return ml.Tensor{}, "", fmt.Errorf("model: load tensor %q: not found", name)
@@ -208,7 +208,7 @@ func loadTensorAuto(ctx context.Context, f *gguf.File, name string) (ml.Tensor, 
 	return ml.From(data, shape...), resolved, nil
 }
 
-func loadQuantizedMatrixAuto(ctx context.Context, f *gguf.File, name string) (*ml.QuantizedMatrix, string, error) {
+func loadQuantizedMatrixAuto(ctx context.Context, f gguf.FileLike, name string) (*ml.QuantizedMatrix, string, error) {
 	resolved, ok := resolveTensorName(f, name)
 	if !ok {
 		return nil, "", fmt.Errorf("model: load tensor %q: not found", name)
@@ -244,7 +244,7 @@ func loadQuantizedMatrixAuto(ctx context.Context, f *gguf.File, name string) (*m
 	return &qmat, resolved, nil
 }
 
-func loadMatWeightAuto(ctx context.Context, f *gguf.File, name string, wantRows, wantCols int) (ml.Tensor, *ml.QuantizedMatrix, string, error) {
+func loadMatWeightAuto(ctx context.Context, f gguf.FileLike, name string, wantRows, wantCols int) (ml.Tensor, *ml.QuantizedMatrix, string, error) {
 	qmat, resolved, err := loadQuantizedMatrixAuto(ctx, f, name)
 	if err != nil {
 		return ml.Tensor{}, nil, "", err

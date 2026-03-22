@@ -40,6 +40,6 @@ type VAD interface {
 }
 
 // New loads a Silero VAD model from the given GGUF file.
-func New(ctx context.Context, f *gguf.File) (VAD, error) {
+func New(ctx context.Context, f gguf.FileLike) (VAD, error) {
 	return NewVAD(ctx, f)
 }

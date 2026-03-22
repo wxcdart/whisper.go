@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/whispergo/whisper.go/internal/dtw"
+	"github.com/whispergo/whisper.go/internal/ggml"
 	"github.com/whispergo/whisper.go/internal/gguf"
 	"github.com/whispergo/whisper.go/internal/model"
 	"github.com/whispergo/whisper.go/internal/vad"
@@ -28,7 +29,7 @@ type Context struct {
 	pipeline   *model.WhisperPipeline
 	dtwAligner *dtw.Aligner
 	vadModel   *vad.SileroVAD
-	file       *gguf.File
+	file       gguf.FileLike
 }
 
 // Params controls transcription behaviour.
@@ -135,8 +136,8 @@ type TokenData struct {
 
 // New loads a model from the given GGUF file path.
 func New(ctx context.Context, modelPath string, params ...Params) (*Context, error) {
-	// Load GGUF file
-	f, err := gguf.Open(ctx, modelPath)
+	// Load GGUF or legacy ggml file
+	f, err := ggml.Open(ctx, modelPath)
 	if err != nil {
 		return nil, fmt.Errorf("load GGUF: %w", err)
 	}
@@ -237,7 +238,7 @@ func (c *Context) Close() error {
 }
 
 // loadVocabFromGGUF extracts tokens and token types from GGUF metadata.
-func loadVocabFromGGUF(f *gguf.File, modelPath string) (*vocab.Vocabulary, error) {
+func loadVocabFromGGUF(f gguf.FileLike, modelPath string) (*vocab.Vocabulary, error) {
 	getMetaAny := func(keys ...string) (any, bool) {
 		for _, k := range keys {
 			if v, ok := f.Meta(k); ok {

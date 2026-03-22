@@ -49,7 +49,7 @@ type WhisperEncoder struct {
 }
 
 // loadTensor loads a named tensor from f and wraps it as ml.Tensor.
-func loadTensor(ctx context.Context, f *gguf.File, name string) (ml.Tensor, error) {
+func loadTensor(ctx context.Context, f gguf.FileLike, name string) (ml.Tensor, error) {
 	data, shape, err := f.Tensor(ctx, name)
 	if err != nil {
 		return ml.Tensor{}, fmt.Errorf("model: load tensor %q: %w", name, err)
@@ -59,7 +59,7 @@ func loadTensor(ctx context.Context, f *gguf.File, name string) (ml.Tensor, erro
 
 // NewEncoder loads an encoder from an open GGUF file.
 // It reads hyperparameters from metadata and pre-loads all encoder weights as float32 tensors.
-func NewEncoder(f *gguf.File) (*WhisperEncoder, error) {
+func NewEncoder(f gguf.FileLike) (*WhisperEncoder, error) {
 	ctx := context.Background()
 
 	nHead, _ := getMetaAny(f, "whisper.encoder.attention.head_count")

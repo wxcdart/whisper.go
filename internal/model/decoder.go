@@ -94,7 +94,7 @@ func (d *WhisperDecoder) SetVocabulary(v *vocab.Vocabulary) {
 }
 
 // NewDecoder loads a decoder from an open GGUF file.
-func NewDecoder(f *gguf.File) (*WhisperDecoder, error) {
+func NewDecoder(f gguf.FileLike) (*WhisperDecoder, error) {
 	ctx := context.Background()
 	var err error
 
