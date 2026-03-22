@@ -57,8 +57,17 @@ var (
 	quantDecisionOnce sync.Once
 	quantDecisionMode int32 // -1 force off, 0 auto, +1 force on
 
-	q8CalibrateOnce sync.Once
-	q8FasterAtomic  atomic.Bool
+	q40CalibrateOnce sync.Once
+	q41CalibrateOnce sync.Once
+	q50CalibrateOnce sync.Once
+	q51CalibrateOnce sync.Once
+	q80CalibrateOnce sync.Once
+
+	q40FasterAtomic atomic.Bool
+	q41FasterAtomic atomic.Bool
+	q50FasterAtomic atomic.Bool
+	q51FasterAtomic atomic.Bool
+	q80FasterAtomic atomic.Bool
 )
 
 // NewQuantizedMatrix validates metadata and wraps raw quantized bytes.
@@ -426,8 +435,9 @@ func ShouldUseQuantMatMul(aRows, k, bRows int, quantType uint32) bool {
 	if mode < 0 {
 		return false
 	}
-	if quantType != QuantTypeQ8_0 {
-		// Keep Q4/Q5 disabled until dedicated SIMD kernels are implemented.
+	switch quantType {
+	case QuantTypeQ4_0, QuantTypeQ4_1, QuantTypeQ5_0, QuantTypeQ5_1, QuantTypeQ8_0:
+	default:
 		return false
 	}
 	if aRows <= 0 || k <= 0 || bRows <= 0 {
@@ -439,13 +449,38 @@ func ShouldUseQuantMatMul(aRows, k, bRows int, quantType uint32) bool {
 	if aRows*k*bRows < (1<<16) || k < 256 {
 		return mode > 0
 	}
-	q8CalibrateOnce.Do(func() {
-		q8FasterAtomic.Store(calibrateQ8MatMul())
-	})
 	if mode > 0 {
 		return true
 	}
-	return q8FasterAtomic.Load()
+	switch quantType {
+	case QuantTypeQ4_0:
+		q40CalibrateOnce.Do(func() {
+			q40FasterAtomic.Store(calibrateQuantMatMul(QuantTypeQ4_0))
+		})
+		return q40FasterAtomic.Load()
+	case QuantTypeQ4_1:
+		q41CalibrateOnce.Do(func() {
+			q41FasterAtomic.Store(calibrateQuantMatMul(QuantTypeQ4_1))
+		})
+		return q41FasterAtomic.Load()
+	case QuantTypeQ5_0:
+		q50CalibrateOnce.Do(func() {
+			q50FasterAtomic.Store(calibrateQuantMatMul(QuantTypeQ5_0))
+		})
+		return q50FasterAtomic.Load()
+	case QuantTypeQ5_1:
+		q51CalibrateOnce.Do(func() {
+			q51FasterAtomic.Store(calibrateQuantMatMul(QuantTypeQ5_1))
+		})
+		return q51FasterAtomic.Load()
+	case QuantTypeQ8_0:
+		q80CalibrateOnce.Do(func() {
+			q80FasterAtomic.Store(calibrateQuantMatMul(QuantTypeQ8_0))
+		})
+		return q80FasterAtomic.Load()
+	default:
+		return false
+	}
 }
 
 func quantDecision() int32 {
@@ -465,7 +500,7 @@ func quantDecision() int32 {
 	return atomic.LoadInt32(&quantDecisionMode)
 }
 
-func calibrateQ8MatMul() bool {
+func calibrateQuantMatMul(quantType uint32) bool {
 	const (
 		m = 1
 		k = 384
@@ -480,12 +515,15 @@ func calibrateQ8MatMul() bool {
 		b.Data[i] = float32((i%29)-14) * 0.03125
 	}
 
-	bQRaw := make([]byte, n*((k+31)/32)*q80BlockBytes)
-	rowBytes := ((k + 31) / 32) * q80BlockBytes
-	for r := 0; r < n; r++ {
-		quantizeQ80RowLocal(bQRaw[r*rowBytes:(r+1)*rowBytes], b.Data[r*k:(r+1)*k])
+	rowBytes, err := quantRowBytes(quantType, k)
+	if err != nil {
+		return false
 	}
-	qmat, err := NewQuantizedMatrix(QuantTypeQ8_0, n, k, bQRaw)
+	bQRaw := make([]byte, n*rowBytes)
+	for r := 0; r < n; r++ {
+		fillSyntheticQuantRowLocal(bQRaw[r*rowBytes:(r+1)*rowBytes], quantType)
+	}
+	qmat, err := NewQuantizedMatrix(quantType, n, k, bQRaw)
 	if err != nil {
 		return false
 	}
@@ -516,6 +554,44 @@ func calibrateQ8MatMul() bool {
 	fDur := time.Since(startF)
 
 	return qDur < fDur
+}
+
+func fillSyntheticQuantRowLocal(dst []byte, quantType uint32) {
+	for i := range dst {
+		dst[i] = byte((i * 37) & 0xFF)
+	}
+	h := float32ToF16Local(1.0)
+	switch quantType {
+	case QuantTypeQ4_0:
+		for off := 0; off+q40BlockBytes <= len(dst); off += q40BlockBytes {
+			dst[off] = byte(h)
+			dst[off+1] = byte(h >> 8)
+		}
+	case QuantTypeQ4_1:
+		for off := 0; off+q41BlockBytes <= len(dst); off += q41BlockBytes {
+			dst[off] = byte(h)
+			dst[off+1] = byte(h >> 8)
+			dst[off+2] = 0
+			dst[off+3] = 0
+		}
+	case QuantTypeQ5_0:
+		for off := 0; off+q50BlockBytes <= len(dst); off += q50BlockBytes {
+			dst[off] = byte(h)
+			dst[off+1] = byte(h >> 8)
+		}
+	case QuantTypeQ5_1:
+		for off := 0; off+q51BlockBytes <= len(dst); off += q51BlockBytes {
+			dst[off] = byte(h)
+			dst[off+1] = byte(h >> 8)
+			dst[off+2] = 0
+			dst[off+3] = 0
+		}
+	case QuantTypeQ8_0:
+		for off := 0; off+q80BlockBytes <= len(dst); off += q80BlockBytes {
+			dst[off] = byte(h)
+			dst[off+1] = byte(h >> 8)
+		}
+	}
 }
 
 func quantizeQ80RowLocal(dst []byte, row []float32) {

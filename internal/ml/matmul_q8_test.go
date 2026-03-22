@@ -29,7 +29,7 @@ func quantizeQ8Row(vals []float32) []byte {
 		if absmax > 0 {
 			scale = absmax / 127.0
 		}
-		h := float32ToF16Local(scale)
+		h := float32ToF16TestLocal(scale)
 		bo := b * q80BlockBytes
 		out[bo] = byte(h)
 		out[bo+1] = byte(h >> 8)
@@ -52,7 +52,7 @@ func quantizeQ8Row(vals []float32) []byte {
 	return out
 }
 
-func float32ToF16Local(f float32) uint16 {
+func float32ToF16TestLocal(f float32) uint16 {
 	bits := math.Float32bits(f)
 	sign := uint16(bits >> 31)
 	exp := int(bits>>23) & 0xFF

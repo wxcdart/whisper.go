@@ -7,7 +7,7 @@ import (
 )
 
 func matMulTransBMaybeQuant(ctx context.Context, a, w ml.Tensor, wq *ml.QuantizedMatrix) (ml.Tensor, error) {
-	if wq != nil {
+	if wq != nil && (len(w.Shape) == 0 || ml.ShouldUseQuantMatMul(a.Shape[0], a.Shape[1], wq.Rows, wq.QuantType)) {
 		out := ml.New(a.Shape[0], wq.Rows)
 		if err := ml.MatMulQuantTransBInto(ctx, a, *wq, out); err != nil {
 			return ml.Tensor{}, err
@@ -18,7 +18,7 @@ func matMulTransBMaybeQuant(ctx context.Context, a, w ml.Tensor, wq *ml.Quantize
 }
 
 func matMulTransBMaybeQuantInto(ctx context.Context, a, w ml.Tensor, wq *ml.QuantizedMatrix, out ml.Tensor) error {
-	if wq != nil {
+	if wq != nil && (len(w.Shape) == 0 || ml.ShouldUseQuantMatMul(a.Shape[0], a.Shape[1], wq.Rows, wq.QuantType)) {
 		return ml.MatMulQuantTransBInto(ctx, a, *wq, out)
 	}
 	return ml.MatMulTransBInto(ctx, a, w, out)
