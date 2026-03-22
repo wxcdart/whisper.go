@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/whispergo/whisper.go/internal/audio"
 	"github.com/whispergo/whisper.go/internal/dtw"
 	"github.com/whispergo/whisper.go/internal/ggml"
 	"github.com/whispergo/whisper.go/internal/gguf"
@@ -177,6 +178,10 @@ func NewWithModelBackend(ctx context.Context, modelPath string, backend model.Co
 		return nil, fmt.Errorf("create pipeline: %w", err)
 	}
 
+	if melFilters, err := loadMelFiltersFromModel(ctx, f); err == nil {
+		pipeline.SetMelFilters(melFilters)
+	}
+
 	return &Context{
 		enc:      enc,
 		dec:      dec,
@@ -184,6 +189,51 @@ func NewWithModelBackend(ctx context.Context, modelPath string, backend model.Co
 		pipeline: pipeline,
 		file:     f,
 	}, nil
+}
+
+func loadMelFiltersFromModel(ctx context.Context, f gguf.FileLike) (audio.MelFilters, error) {
+	keys := []string{
+		"mel_filters",
+		"model.mel_filters",
+		"whisper.mel_filters",
+	}
+
+	for _, key := range keys {
+		data, shape, err := f.Tensor(ctx, key)
+		if err != nil {
+			continue
+		}
+		if len(shape) != 2 {
+			continue
+		}
+		rows, cols := shape[0], shape[1]
+		if rows <= 0 || cols <= 0 {
+			continue
+		}
+		if len(data) != rows*cols {
+			continue
+		}
+
+		// Expected orientation is [n_mel, n_freq] where n_freq = 201.
+		nMel := rows
+		nFreq := cols
+		if rows == audio.NFFT/2+1 && cols == audio.NMel {
+			// Transpose [n_freq, n_mel] into [n_mel, n_freq].
+			nMel = cols
+			nFreq = rows
+			transposed := make([]float32, len(data))
+			for r := 0; r < rows; r++ {
+				for c := 0; c < cols; c++ {
+					transposed[c*nFreq+r] = data[r*cols+c]
+				}
+			}
+			return audio.MelFilters{NMel: nMel, Data: transposed}, nil
+		}
+
+		return audio.MelFilters{NMel: nMel, Data: data}, nil
+	}
+
+	return audio.MelFilters{}, fmt.Errorf("mel filters tensor not found")
 }
 
 // Transcribe transcribes audio samples (mono float32 at 16 kHz) and returns the result.

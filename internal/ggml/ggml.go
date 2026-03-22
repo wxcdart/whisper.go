@@ -126,6 +126,10 @@ func parseBin(f *os.File) (*binFile, error) {
 
 	melElems := uint64(melRows) * uint64(melCols)
 	melBytes := int64(melElems * 4)
+	melOffset, err := f.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return nil, fmt.Errorf("legacy bin: get mel data offset: %w", err)
+	}
 	if melBytes > 0 {
 		if _, err := f.Seek(melBytes, io.SeekCurrent); err != nil {
 			return nil, fmt.Errorf("legacy bin: skip mel data: %w", err)
@@ -157,6 +161,21 @@ func parseBin(f *os.File) (*binFile, error) {
 		offset uint64
 	})
 	names := make([]string, 0, 512)
+
+	if melRows > 0 && melCols > 0 {
+		// Expose mel filterbank to downstream code so audio preprocessing can
+		// use model-native filters instead of a dummy fallback.
+		names = append(names, "mel_filters")
+		tdmap["mel_filters"] = struct {
+			shape  []uint64
+			dtype  uint32
+			offset uint64
+		}{
+			shape:  []uint64{uint64(melRows), uint64(melCols)},
+			dtype:  0, // F32
+			offset: uint64(melOffset),
+		}
+	}
 	fileInfo, err := f.Stat()
 	if err != nil {
 		return nil, fmt.Errorf("legacy bin: stat file: %w", err)

@@ -18,6 +18,7 @@ type WhisperPipeline struct {
 	vocab   *vocab.Vocabulary
 	vad     vad.VAD
 	dtw     DTWAligner
+	mel     audio.MelFilters
 }
 
 // New creates a pipeline from encoder, decoder, vocabulary, and optional VAD/DTW.
@@ -31,7 +32,28 @@ func New(enc Encoder, dec Decoder, v *vocab.Vocabulary, vadModel vad.VAD, dtwAli
 		vocab:   v,
 		vad:     vadModel,
 		dtw:     dtwAligner,
+		mel:     defaultMelFilters(audio.NMel),
 	}, nil
+}
+
+// SetMelFilters configures the mel filterbank used by audio preprocessing.
+func (p *WhisperPipeline) SetMelFilters(filters audio.MelFilters) {
+	if len(filters.Data) == 0 {
+		return
+	}
+	p.mel = filters
+}
+
+func defaultMelFilters(nMel int) audio.MelFilters {
+	nFreq := audio.NFFT/2 + 1
+	filters := audio.MelFilters{NMel: nMel, Data: make([]float32, nMel*nFreq)}
+	for m := 0; m < nMel; m++ {
+		k := m * nFreq / nMel
+		if k < nFreq {
+			filters.Data[m*nFreq+k] = 1.0
+		}
+	}
+	return filters
 }
 
 // Transcribe runs the full inference loop over chunked audio.
@@ -123,21 +145,9 @@ func (p *WhisperPipeline) Transcribe(ctx context.Context, samples []float32, par
 			}
 		}
 
-		// Compute mel-spectrogram
-		nFreq := audio.NFFT/2 + 1
-		melFilters := audio.MelFilters{NMel: audio.NMel}
-		if melFilters.Data == nil {
-			// Create dummy mel filters for testing
-			melFilters.Data = make([]float32, audio.NMel*nFreq)
-			for m := 0; m < audio.NMel; m++ {
-				k := m * nFreq / audio.NMel
-				if k < nFreq {
-					melFilters.Data[m*nFreq+k] = 1.0
-				}
-			}
-		}
+		// Compute mel-spectrogram with model-native filterbank.
 		melStart := time.Now()
-		mel, err := audio.LogMel(ctx, chunkSamples, melFilters)
+		mel, err := audio.LogMel(ctx, chunkSamples, p.mel)
 		if err != nil {
 			return nil, fmt.Errorf("pipeline: mel spectrogram: %w", err)
 		}
@@ -211,20 +221,8 @@ func (p *WhisperPipeline) detectLanguage(ctx context.Context, samples []float32,
 		samples = samples[:windowSamples]
 	}
 
-	// Compute mel-spectrogram
-	nFreq := audio.NFFT/2 + 1
-	melFilters := audio.MelFilters{NMel: audio.NMel}
-	if melFilters.Data == nil {
-		// Create dummy mel filters for testing
-		melFilters.Data = make([]float32, audio.NMel*nFreq)
-		for m := 0; m < audio.NMel; m++ {
-			k := m * nFreq / audio.NMel
-			if k < nFreq {
-				melFilters.Data[m*nFreq+k] = 1.0
-			}
-		}
-	}
-	mel, err := audio.LogMel(ctx, samples, melFilters)
+	// Compute mel-spectrogram with model-native filterbank.
+	mel, err := audio.LogMel(ctx, samples, p.mel)
 	if err != nil {
 		return "", ml.Tensor{}, fmt.Errorf("language detection: mel spectrogram: %w", err)
 	}
