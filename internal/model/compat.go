@@ -30,17 +30,17 @@ func resolveTensorName(f *gguf.File, name string) (string, bool) {
 
 func mapTensorName(name string) string {
 	simple := map[string]string{
-		"encoder.conv1.weight":          "model.encoder.conv1.weight",
-		"encoder.conv1.bias":            "model.encoder.conv1.bias",
-		"encoder.conv2.weight":          "model.encoder.conv2.weight",
-		"encoder.conv2.bias":            "model.encoder.conv2.bias",
-		"encoder.positional_embedding":  "model.encoder.embed_positions.weight",
-		"encoder.ln_post.weight":        "model.encoder.layer_norm.weight",
-		"encoder.ln_post.bias":          "model.encoder.layer_norm.bias",
+		"encoder.conv1.weight":           "model.encoder.conv1.weight",
+		"encoder.conv1.bias":             "model.encoder.conv1.bias",
+		"encoder.conv2.weight":           "model.encoder.conv2.weight",
+		"encoder.conv2.bias":             "model.encoder.conv2.bias",
+		"encoder.positional_embedding":   "model.encoder.embed_positions.weight",
+		"encoder.ln_post.weight":         "model.encoder.layer_norm.weight",
+		"encoder.ln_post.bias":           "model.encoder.layer_norm.bias",
 		"decoder.token_embedding.weight": "model.decoder.embed_tokens.weight",
-		"decoder.positional_embedding":  "model.decoder.embed_positions.weight",
-		"decoder.ln.weight":             "model.decoder.layer_norm.weight",
-		"decoder.ln.bias":               "model.decoder.layer_norm.bias",
+		"decoder.positional_embedding":   "model.decoder.embed_positions.weight",
+		"decoder.ln.weight":              "model.decoder.layer_norm.weight",
+		"decoder.ln.bias":                "model.decoder.layer_norm.bias",
 	}
 	if mapped, ok := simple[name]; ok {
 		return mapped
@@ -206,4 +206,65 @@ func loadTensorAuto(ctx context.Context, f *gguf.File, name string) (ml.Tensor, 
 		return ml.Tensor{}, resolved, fmt.Errorf("model: load tensor %q (resolved %q): %w", name, resolved, err)
 	}
 	return ml.From(data, shape...), resolved, nil
+}
+
+func loadQuantizedMatrixAuto(ctx context.Context, f *gguf.File, name string) (*ml.QuantizedMatrix, string, error) {
+	resolved, ok := resolveTensorName(f, name)
+	if !ok {
+		return nil, "", fmt.Errorf("model: load tensor %q: not found", name)
+	}
+	raw, shape, qtype, err := f.TensorRaw(ctx, resolved)
+	if err != nil {
+		return nil, resolved, fmt.Errorf("model: load tensor %q (resolved %q): %w", name, resolved, err)
+	}
+	if len(shape) != 2 {
+		return nil, resolved, nil
+	}
+
+	var mlQType uint32
+	switch qtype {
+	case gguf.QuantQ4_0:
+		mlQType = ml.QuantTypeQ4_0
+	case gguf.QuantQ4_1:
+		mlQType = ml.QuantTypeQ4_1
+	case gguf.QuantQ5_0:
+		mlQType = ml.QuantTypeQ5_0
+	case gguf.QuantQ5_1:
+		mlQType = ml.QuantTypeQ5_1
+	case gguf.QuantQ8_0:
+		mlQType = ml.QuantTypeQ8_0
+	default:
+		return nil, resolved, nil
+	}
+
+	qmat, err := ml.NewQuantizedMatrix(mlQType, shape[0], shape[1], raw)
+	if err != nil {
+		return nil, resolved, err
+	}
+	return &qmat, resolved, nil
+}
+
+func loadMatWeightAuto(ctx context.Context, f *gguf.File, name string, wantRows, wantCols int) (ml.Tensor, *ml.QuantizedMatrix, string, error) {
+	qmat, resolved, err := loadQuantizedMatrixAuto(ctx, f, name)
+	if err != nil {
+		return ml.Tensor{}, nil, "", err
+	}
+	if qmat != nil && qmat.Rows == wantRows && qmat.Cols == wantCols {
+		return ml.Tensor{}, qmat, resolved, nil
+	}
+
+	t, resolved, err := loadTensorAuto(ctx, f, name)
+	if err != nil {
+		return ml.Tensor{}, nil, "", err
+	}
+	if len(t.Shape) != 2 {
+		return ml.Tensor{}, nil, resolved, fmt.Errorf("model: invalid %s shape %v", name, t.Shape)
+	}
+	if t.Shape[0] == wantRows && t.Shape[1] == wantCols {
+		return t, nil, resolved, nil
+	}
+	if t.Shape[0] == wantCols && t.Shape[1] == wantRows {
+		return ml.Transpose(t, 1, 0), nil, resolved, nil
+	}
+	return ml.Tensor{}, nil, resolved, fmt.Errorf("model: unsupported %s shape %v", name, t.Shape)
 }

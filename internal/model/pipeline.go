@@ -3,6 +3,7 @@ package model
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/whispergo/whisper.go/internal/audio"
 	"github.com/whispergo/whisper.go/internal/ml"
@@ -35,6 +36,7 @@ func New(enc Encoder, dec Decoder, v *vocab.Vocabulary, vadModel vad.VAD, dtwAli
 
 // Transcribe runs the full inference loop over chunked audio.
 func (p *WhisperPipeline) Transcribe(ctx context.Context, samples []float32, params TranscribeParams) (*Result, error) {
+	startAll := time.Now()
 	if ctx.Err() != nil {
 		return nil, ctx.Err()
 	}
@@ -49,7 +51,7 @@ func (p *WhisperPipeline) Transcribe(ctx context.Context, samples []float32, par
 
 	// Constants for chunking
 	windowSamples := audio.ChunkSize * audio.SampleRate // 30 seconds * 16000 Hz = 480000 samples
-	hopSamples := 1 * audio.SampleRate                  // 1 second * 16000 Hz = 16000 samples
+	hopSamples := windowSamples                         // non-overlapping 30-second windows
 
 	// Compute chunks
 	numChunks := (len(samples) + hopSamples - 1) / hopSamples
@@ -61,10 +63,13 @@ func (p *WhisperPipeline) Transcribe(ctx context.Context, samples []float32, par
 		Segments: []Segment{},
 		Language: "",
 	}
+	var firstChunkEncoderOut ml.Tensor
+	firstChunkEncoderReady := false
 
 	// Language detection on first chunk
 	if params.AutoDetectLanguage {
-		lang, err := p.detectLanguage(ctx, samples[:minInt(len(samples), windowSamples)], params)
+		langStart := time.Now()
+		lang, encOut, err := p.detectLanguage(ctx, samples[:minInt(len(samples), windowSamples)], params)
 		if err != nil {
 			if params.Logger != nil {
 				params.Logger.Error("language detection failed", "error", err)
@@ -72,8 +77,10 @@ func (p *WhisperPipeline) Transcribe(ctx context.Context, samples []float32, par
 			return nil, fmt.Errorf("pipeline: language detection: %w", err)
 		}
 		result.Language = lang
+		firstChunkEncoderOut = encOut
+		firstChunkEncoderReady = true
 		if params.Logger != nil {
-			params.Logger.Info("language detected", "lang", lang)
+			params.Logger.Info("language detected", "lang", lang, "ms", time.Since(langStart).Milliseconds())
 		}
 	} else if params.Language != "" {
 		result.Language = params.Language
@@ -81,6 +88,7 @@ func (p *WhisperPipeline) Transcribe(ctx context.Context, samples []float32, par
 
 	// Process each chunk
 	for chunkIdx := 0; chunkIdx < numChunks; chunkIdx++ {
+		chunkStart := time.Now()
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
@@ -128,20 +136,31 @@ func (p *WhisperPipeline) Transcribe(ctx context.Context, samples []float32, par
 				}
 			}
 		}
+		melStart := time.Now()
 		mel, err := audio.LogMel(ctx, chunkSamples, melFilters)
 		if err != nil {
 			return nil, fmt.Errorf("pipeline: mel spectrogram: %w", err)
 		}
+		melMs := time.Since(melStart).Milliseconds()
 
 		// Convert mel to tensor
 		melTensor := ml.New(mel.NMel, mel.NLen)
 		melTensor.Data = mel.Data
 
 		// Encode
-		encoderOut, err := p.encoder.Encode(ctx, melTensor)
-		if err != nil {
-			return nil, fmt.Errorf("pipeline: encoder: %w", err)
+		encStart := time.Now()
+		encReused := false
+		var encoderOut ml.Tensor
+		if chunkIdx == 0 && firstChunkEncoderReady {
+			encoderOut = firstChunkEncoderOut
+			encReused = true
+		} else {
+			encoderOut, err = p.encoder.Encode(ctx, melTensor)
+			if err != nil {
+				return nil, fmt.Errorf("pipeline: encoder: %w", err)
+			}
 		}
+		encMs := time.Since(encStart).Milliseconds()
 
 		// Prepare decoder prompt
 		prompt := p.buildPrompt(result.Language, params, chunkIdx == 0)
@@ -150,29 +169,38 @@ func (p *WhisperPipeline) Transcribe(ctx context.Context, samples []float32, par
 		decoderParams := params.DecoderParams
 		decoderParams.Prompt = prompt
 
+		decStart := time.Now()
 		segments, err := p.decoder.Decode(ctx, encoderOut, decoderParams)
 		if err != nil {
 			return nil, fmt.Errorf("pipeline: decoder: %w", err)
 		}
+		decMs := time.Since(decStart).Milliseconds()
 
 		// Post-process segments
+		postStart := time.Now()
 		processedSegments, err := p.postProcessSegments(ctx, segments, params, int64(startSample)*1000/int64(audio.SampleRate))
 		if err != nil {
 			return nil, fmt.Errorf("pipeline: post-processing: %w", err)
 		}
+		postMs := time.Since(postStart).Milliseconds()
+		chunkMs := time.Since(chunkStart).Milliseconds()
 
 		if params.Logger != nil && len(processedSegments) > 0 {
-			params.Logger.Info("chunk transcribed", "index", chunkIdx, "segments", len(processedSegments))
+			params.Logger.Info("chunk transcribed", "index", chunkIdx, "segments", len(processedSegments), "mel_ms", melMs, "enc_ms", encMs, "enc_reused", encReused, "dec_ms", decMs, "post_ms", postMs, "chunk_ms", chunkMs)
 		}
 
 		result.Segments = append(result.Segments, processedSegments...)
+	}
+
+	if params.Logger != nil {
+		params.Logger.Info("transcription finished", "chunks", numChunks, "segments", len(result.Segments), "total_ms", time.Since(startAll).Milliseconds())
 	}
 
 	return result, nil
 }
 
 // detectLanguage detects the language from the first chunk.
-func (p *WhisperPipeline) detectLanguage(ctx context.Context, samples []float32, params TranscribeParams) (string, error) {
+func (p *WhisperPipeline) detectLanguage(ctx context.Context, samples []float32, params TranscribeParams) (string, ml.Tensor, error) {
 	// Ensure samples are exactly windowSamples long
 	windowSamples := audio.ChunkSize * audio.SampleRate
 	if len(samples) < windowSamples {
@@ -198,7 +226,7 @@ func (p *WhisperPipeline) detectLanguage(ctx context.Context, samples []float32,
 	}
 	mel, err := audio.LogMel(ctx, samples, melFilters)
 	if err != nil {
-		return "", fmt.Errorf("language detection: mel spectrogram: %w", err)
+		return "", ml.Tensor{}, fmt.Errorf("language detection: mel spectrogram: %w", err)
 	}
 
 	// Convert mel to tensor
@@ -208,7 +236,7 @@ func (p *WhisperPipeline) detectLanguage(ctx context.Context, samples []float32,
 	// Encode
 	encoderOut, err := p.encoder.Encode(ctx, melTensor)
 	if err != nil {
-		return "", fmt.Errorf("language detection: encoder: %w", err)
+		return "", ml.Tensor{}, fmt.Errorf("language detection: encoder: %w", err)
 	}
 
 	// Create prompt: [SOT, <|lang|>, <|transcribe|>]
@@ -223,7 +251,7 @@ func (p *WhisperPipeline) detectLanguage(ctx context.Context, samples []float32,
 
 	segments, err := p.decoder.Decode(ctx, encoderOut, decoderParams)
 	if err != nil {
-		return "", fmt.Errorf("language detection: decode: %w", err)
+		return "", ml.Tensor{}, fmt.Errorf("language detection: decode: %w", err)
 	}
 
 	// Extract language from first token
@@ -233,12 +261,12 @@ func (p *WhisperPipeline) detectLanguage(ctx context.Context, samples []float32,
 		// Extract language code from token like "<|en|>"
 		if len(langToken) > 4 && langToken[0] == '<' && langToken[1] == '|' && langToken[len(langToken)-1] == '>' && langToken[len(langToken)-2] == '|' {
 			lang := langToken[2 : len(langToken)-2]
-			return lang, nil
+			return lang, encoderOut, nil
 		}
 	}
 
 	// Default to English if detection fails
-	return "en", nil
+	return "en", encoderOut, nil
 }
 
 // buildPrompt constructs the decoder prompt.

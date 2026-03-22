@@ -57,6 +57,7 @@ type Params struct {
 	SuppressNST        bool
 	SuppressRegex      string
 	DTWPreset          string
+	Logger             model.Logger // Optional logger for progress/timing
 	// VAD
 	VADEnabled        bool
 	VADModelPath      string
@@ -208,6 +209,7 @@ func (c *Context) Transcribe(ctx context.Context, samples []float32, params Para
 		MaxContext:         params.MaxContext,
 		AudioCtx:           params.AudioCtx,
 		Threads:            params.Threads,
+		Logger:             params.Logger, // Pass through logger
 		VADEnabled:         params.VADEnabled,
 		VADModelPath:       params.VADModelPath,
 	}

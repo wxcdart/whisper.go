@@ -205,6 +205,27 @@ func (f *File) Tensor(ctx context.Context, name string) ([]float32, []int, error
 	return out, shape, nil
 }
 
+// TensorRaw returns raw tensor bytes, shape, and stored quantisation type for the named tensor.
+func (f *File) TensorRaw(ctx context.Context, name string) ([]byte, []int, QuantType, error) {
+	td, ok := f.tensorIndex[name]
+	if !ok {
+		return nil, nil, QuantF32, fmt.Errorf("gguf: tensor %q not found", name)
+	}
+	numElems := uint64(1)
+	for _, d := range td.shape {
+		numElems *= d
+	}
+	raw, err := readTensorRaw(ctx, f.f, f.dataStart+int64(td.offset), td.dtype, numElems)
+	if err != nil {
+		return nil, nil, QuantF32, fmt.Errorf("gguf: tensor %q: %w", name, err)
+	}
+	shape := make([]int, len(td.shape))
+	for i, d := range td.shape {
+		shape[i] = int(d)
+	}
+	return raw, shape, QuantType(td.dtype), nil
+}
+
 // TensorType returns the QuantType of the named tensor, or (QuantF32, false) if not found.
 func (f *File) TensorType(name string) (QuantType, bool) {
 	td, ok := f.tensorIndex[name]

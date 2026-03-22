@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 	"unsafe"
 
 	"github.com/whispergo/whisper.go"
@@ -43,8 +44,8 @@ func run(ctx context.Context) error {
 
 	// VAD flags
 	var (
-		vad       bool
-		vadModel  string
+		vad      bool
+		vadModel string
 	)
 
 	// Processing flags
@@ -88,9 +89,9 @@ func run(ctx context.Context) error {
 
 	// Advanced flags
 	var (
-		modelType         string
+		modelType          string
 		dtwTokenTimestamps bool
-		verbose           int
+		verbose            int
 	)
 
 	// Define flags - matching whisper.cpp exactly
@@ -223,30 +224,33 @@ func run(ctx context.Context) error {
 
 	// Build params
 	params := whisper.Params{
-		Language:          language,
-		Task:              task,
-		Threads:           threads,
-		BeamSize:          beamSize,
-		BestOf:            bestOf,
-		Temperature:       float32(temperature),
-		TemperatureInc:    float32(temperatureInc),
-		EntropyThold:      float32(entropyThold),
-		LogprobThold:      float32(logprobThold),
-		NoSpeechThold:     float32(threshold),
-		NoFallback:        false,
-		MaxLen:            maxLen,
-		SplitOnWord:       splitOnWord,
-		NoTimestamps:      noTimestamps,
-		InitialPrompt:     initialPrompt,
+		Language:           language,
+		Task:               task,
+		Threads:            threads,
+		BeamSize:           beamSize,
+		BestOf:             bestOf,
+		Temperature:        float32(temperature),
+		TemperatureInc:     float32(temperatureInc),
+		EntropyThold:       float32(entropyThold),
+		LogprobThold:       float32(logprobThold),
+		NoSpeechThold:      float32(threshold),
+		NoFallback:         false,
+		MaxLen:             maxLen,
+		SplitOnWord:        splitOnWord,
+		NoTimestamps:       noTimestamps,
+		InitialPrompt:      initialPrompt,
 		CarryInitialPrompt: carryInitialPrompt,
-		OffsetMs:          offsetMs,
-		DurationMs:        durationMs,
-		MaxContext:        0,
-		AudioCtx:          audioCtx,
-		SuppressNST:       suppressNST,
-		SuppressRegex:     suppressRegex,
-		VADEnabled:        vad,
-		VADModelPath:      vadModel,
+		OffsetMs:           offsetMs,
+		DurationMs:         durationMs,
+		MaxContext:         0,
+		AudioCtx:           audioCtx,
+		SuppressNST:        suppressNST,
+		SuppressRegex:      suppressRegex,
+		VADEnabled:         vad,
+		VADModelPath:       vadModel,
+	}
+	if verbose >= 2 {
+		params.Logger = &cliLogger{verbose: verbose}
 	}
 
 	// Handle no-context flag compatibility
@@ -268,10 +272,12 @@ func run(ctx context.Context) error {
 	if verbose > 0 {
 		fmt.Fprintf(os.Stderr, "Transcribing audio...\n")
 	}
+	transcribeStart := time.Now()
 	result, err := transcriber.Transcribe(ctx, samples, params)
 	if err != nil {
 		return fmt.Errorf("transcription failed: %w", err)
 	}
+	transcribeMs := time.Since(transcribeStart).Milliseconds()
 
 	if verbose > 0 {
 		fmt.Fprintf(os.Stderr, "Detected language: %s\n", result.Language)
@@ -303,7 +309,7 @@ func run(ctx context.Context) error {
 	}
 
 	if verbose > 0 {
-		fmt.Fprintf(os.Stderr, "Transcription complete\n")
+		fmt.Fprintf(os.Stderr, "Transcription complete in %d ms\n", transcribeMs)
 	}
 
 	return nil
@@ -410,4 +416,41 @@ func resample(samples []float32, srcRate, dstRate int) []float32 {
 	}
 
 	return out
+}
+
+type cliLogger struct {
+	verbose int
+}
+
+func (l *cliLogger) Debug(msg string, args ...any) {
+	if l.verbose < 2 {
+		return
+	}
+	l.log("DEBUG", msg, args...)
+}
+
+func (l *cliLogger) Info(msg string, args ...any) {
+	if l.verbose < 2 {
+		return
+	}
+	l.log("INFO", msg, args...)
+}
+
+func (l *cliLogger) Warn(msg string, args ...any) {
+	l.log("WARN", msg, args...)
+}
+
+func (l *cliLogger) Error(msg string, args ...any) {
+	l.log("ERROR", msg, args...)
+}
+
+func (l *cliLogger) log(level, msg string, args ...any) {
+	fmt.Fprintf(os.Stderr, "[%s] %s", level, msg)
+	for i := 0; i+1 < len(args); i += 2 {
+		fmt.Fprintf(os.Stderr, " %v=%v", args[i], args[i+1])
+	}
+	if len(args)%2 == 1 {
+		fmt.Fprintf(os.Stderr, " extra=%v", args[len(args)-1])
+	}
+	fmt.Fprintf(os.Stderr, "\n")
 }

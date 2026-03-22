@@ -4,6 +4,8 @@ import (
 	"context"
 	"math"
 	"testing"
+
+	"github.com/whispergo/whisper.go/internal/gguf"
 )
 
 func quantizeQ8Row(vals []float32) []byte {
@@ -143,5 +145,63 @@ func TestMatMulQ8_0TransBInto(t *testing.T) {
 		if !approxEq(got.Data[i], ref.Data[i], 1.0) {
 			t.Fatalf("[%d] mismatch: got=%v ref=%v", i, got.Data[i], ref.Data[i])
 		}
+	}
+}
+
+func TestMatMulQuantTransBInto_AllSupported(t *testing.T) {
+	ctx := context.Background()
+	m, k, n := 2, 64, 3
+	a := New(m, k)
+	for i := range a.Data {
+		a.Data[i] = float32((i%17)-8) * 0.07
+	}
+	bF := New(n, k)
+	for i := range bF.Data {
+		bF.Data[i] = float32((i%11)-5) * 0.11
+	}
+
+	tests := []struct {
+		name      string
+		quantType uint32
+		quantize  func([]float32) []byte
+		tol       float32
+	}{
+		{name: "q4_0", quantType: QuantTypeQ4_0, quantize: gguf.QuantizeQ4_0, tol: 4.0},
+		{name: "q4_1", quantType: QuantTypeQ4_1, quantize: gguf.QuantizeQ4_1, tol: 4.0},
+		{name: "q5_0", quantType: QuantTypeQ5_0, quantize: gguf.QuantizeQ5_0, tol: 3.0},
+		{name: "q5_1", quantType: QuantTypeQ5_1, quantize: gguf.QuantizeQ5_1, tol: 3.0},
+		{name: "q8_0", quantType: QuantTypeQ8_0, quantize: gguf.QuantizeQ8_0, tol: 1.0},
+	}
+
+	ref, err := MatMulTransB(ctx, a, bF)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rowBytes, err := quantRowBytes(tt.quantType, k)
+			if err != nil {
+				t.Fatal(err)
+			}
+			bQ := make([]byte, n*rowBytes)
+			for r := 0; r < n; r++ {
+				row := bF.Data[r*k : (r+1)*k]
+				copy(bQ[r*rowBytes:(r+1)*rowBytes], tt.quantize(row))
+			}
+			qmat, err := NewQuantizedMatrix(tt.quantType, n, k, bQ)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := New(m, n)
+			if err := MatMulQuantTransBInto(ctx, a, qmat, got); err != nil {
+				t.Fatal(err)
+			}
+			for i := range ref.Data {
+				if !approxEq(got.Data[i], ref.Data[i], tt.tol) {
+					t.Fatalf("[%d] mismatch: got=%v ref=%v", i, got.Data[i], ref.Data[i])
+				}
+			}
+		})
 	}
 }

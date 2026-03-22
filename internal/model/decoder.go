@@ -14,17 +14,24 @@ import (
 // decoderCrossAttn holds Q/K/V/out weights for cross-attention to encoder output.
 type decoderCrossAttn struct {
 	qW, qB     ml.Tensor // [nTextState, nTextState], [nTextState]
+	qWQ        *ml.QuantizedMatrix
 	kW, vW     ml.Tensor // [nTextState, nTextState] (no bias)
+	kWQ, vWQ   *ml.QuantizedMatrix
 	vB         ml.Tensor // [nTextState]
 	outW, outB ml.Tensor // [nTextState, nTextState], [nTextState]
+	outWQ      *ml.QuantizedMatrix
 }
 
 // decoderSelfAttn holds Q/K/V/out weights for causal self-attention (with KV cache).
 type decoderSelfAttn struct {
 	qW, qB     ml.Tensor // [nTextState, nTextState], [nTextState]
+	qWQ        *ml.QuantizedMatrix
 	kW         ml.Tensor // [nTextState, nTextState] (no bias)
+	kWQ        *ml.QuantizedMatrix
 	vW, vB     ml.Tensor // [nTextState, nTextState], [nTextState]
+	vWQ        *ml.QuantizedMatrix
 	outW, outB ml.Tensor // [nTextState, nTextState], [nTextState]
+	outWQ      *ml.QuantizedMatrix
 }
 
 // decoderBlock holds all weight tensors for one transformer decoder block.
@@ -40,7 +47,9 @@ type decoderBlock struct {
 	// MLP
 	mlpLnW, mlpLnB ml.Tensor // [nTextState]
 	mlp0W, mlp0B   ml.Tensor // [4*nTextState, nTextState], [4*nTextState]
+	mlp0WQ         *ml.QuantizedMatrix
 	mlp2W, mlp2B   ml.Tensor // [nTextState, 4*nTextState], [nTextState]
+	mlp2WQ         *ml.QuantizedMatrix
 }
 
 // WhisperDecoder implements the Decoder interface.
@@ -52,8 +61,9 @@ type WhisperDecoder struct {
 	nTextCtx   int
 
 	// Embeddings
-	tokenEmb ml.Tensor // [nVocab, nTextState]
-	posEmb   ml.Tensor // [nTextCtx, nTextState]
+	tokenEmb  ml.Tensor // [nVocab, nTextState]
+	tokenEmbQ *ml.QuantizedMatrix
+	posEmb    ml.Tensor // [nTextCtx, nTextState]
 
 	// Transformer blocks
 	blocks []decoderBlock
@@ -146,14 +156,18 @@ func NewDecoder(f *gguf.File) (*WhisperDecoder, error) {
 	}
 
 	// Load token embedding [nVocab, nTextState].
-	if d.tokenEmb, _, err = loadTensorAuto(ctx, f, "decoder.token_embedding.weight"); err != nil {
-		return nil, err
-	}
-	if len(d.tokenEmb.Shape) != 2 {
-		return nil, fmt.Errorf("model: decoder: invalid token embedding shape %v", d.tokenEmb.Shape)
-	}
-	if d.tokenEmb.Shape[0] == d.nTextState && d.tokenEmb.Shape[1] == d.nVocab {
-		d.tokenEmb = ml.Transpose(d.tokenEmb, 1, 0)
+	if q, _, qErr := loadQuantizedMatrixAuto(ctx, f, "decoder.token_embedding.weight"); qErr == nil && q != nil && q.Rows == d.nVocab && q.Cols == d.nTextState {
+		d.tokenEmbQ = q
+	} else {
+		if d.tokenEmb, _, err = loadTensorAuto(ctx, f, "decoder.token_embedding.weight"); err != nil {
+			return nil, err
+		}
+		if len(d.tokenEmb.Shape) != 2 {
+			return nil, fmt.Errorf("model: decoder: invalid token embedding shape %v", d.tokenEmb.Shape)
+		}
+		if d.tokenEmb.Shape[0] == d.nTextState && d.tokenEmb.Shape[1] == d.nVocab {
+			d.tokenEmb = ml.Transpose(d.tokenEmb, 1, 0)
+		}
 	}
 
 	// Load positional embedding [nTextCtx, nTextState].
@@ -181,22 +195,22 @@ func NewDecoder(f *gguf.File) (*WhisperDecoder, error) {
 		}
 
 		// Self-attention weights.
-		if b.selfAttn.qW, _, err = loadTensorAuto(ctx, f, p+".self_attn.query.weight"); err != nil {
+		if b.selfAttn.qW, b.selfAttn.qWQ, _, err = loadMatWeightAuto(ctx, f, p+".self_attn.query.weight", int(nTextState), int(nTextState)); err != nil {
 			return nil, err
 		}
 		if b.selfAttn.qB, _, err = loadTensorAuto(ctx, f, p+".self_attn.query.bias"); err != nil {
 			return nil, err
 		}
-		if b.selfAttn.kW, _, err = loadTensorAuto(ctx, f, p+".self_attn.key.weight"); err != nil {
+		if b.selfAttn.kW, b.selfAttn.kWQ, _, err = loadMatWeightAuto(ctx, f, p+".self_attn.key.weight", int(nTextState), int(nTextState)); err != nil {
 			return nil, err
 		}
-		if b.selfAttn.vW, _, err = loadTensorAuto(ctx, f, p+".self_attn.value.weight"); err != nil {
+		if b.selfAttn.vW, b.selfAttn.vWQ, _, err = loadMatWeightAuto(ctx, f, p+".self_attn.value.weight", int(nTextState), int(nTextState)); err != nil {
 			return nil, err
 		}
 		if b.selfAttn.vB, _, err = loadTensorAuto(ctx, f, p+".self_attn.value.bias"); err != nil {
 			return nil, err
 		}
-		if b.selfAttn.outW, _, err = loadTensorAuto(ctx, f, p+".self_attn.out.weight"); err != nil {
+		if b.selfAttn.outW, b.selfAttn.outWQ, _, err = loadMatWeightAuto(ctx, f, p+".self_attn.out.weight", int(nTextState), int(nTextState)); err != nil {
 			return nil, err
 		}
 		if b.selfAttn.outB, _, err = loadTensorAuto(ctx, f, p+".self_attn.out.bias"); err != nil {
@@ -212,22 +226,22 @@ func NewDecoder(f *gguf.File) (*WhisperDecoder, error) {
 		}
 
 		// Cross-attention weights.
-		if b.crossAttn.qW, _, err = loadTensorAuto(ctx, f, p+".cross_attn.query.weight"); err != nil {
+		if b.crossAttn.qW, b.crossAttn.qWQ, _, err = loadMatWeightAuto(ctx, f, p+".cross_attn.query.weight", int(nTextState), int(nTextState)); err != nil {
 			return nil, err
 		}
 		if b.crossAttn.qB, _, err = loadTensorAuto(ctx, f, p+".cross_attn.query.bias"); err != nil {
 			return nil, err
 		}
-		if b.crossAttn.kW, _, err = loadTensorAuto(ctx, f, p+".cross_attn.key.weight"); err != nil {
+		if b.crossAttn.kW, b.crossAttn.kWQ, _, err = loadMatWeightAuto(ctx, f, p+".cross_attn.key.weight", int(nTextState), int(nTextState)); err != nil {
 			return nil, err
 		}
-		if b.crossAttn.vW, _, err = loadTensorAuto(ctx, f, p+".cross_attn.value.weight"); err != nil {
+		if b.crossAttn.vW, b.crossAttn.vWQ, _, err = loadMatWeightAuto(ctx, f, p+".cross_attn.value.weight", int(nTextState), int(nTextState)); err != nil {
 			return nil, err
 		}
 		if b.crossAttn.vB, _, err = loadTensorAuto(ctx, f, p+".cross_attn.value.bias"); err != nil {
 			return nil, err
 		}
-		if b.crossAttn.outW, _, err = loadTensorAuto(ctx, f, p+".cross_attn.out.weight"); err != nil {
+		if b.crossAttn.outW, b.crossAttn.outWQ, _, err = loadMatWeightAuto(ctx, f, p+".cross_attn.out.weight", int(nTextState), int(nTextState)); err != nil {
 			return nil, err
 		}
 		if b.crossAttn.outB, _, err = loadTensorAuto(ctx, f, p+".cross_attn.out.bias"); err != nil {
@@ -242,39 +256,17 @@ func NewDecoder(f *gguf.File) (*WhisperDecoder, error) {
 			return nil, err
 		}
 
-		// Desired layout for MatMulTransB is [4D, D].
-		t, _, err := loadTensorAuto(ctx, f, p+".mlp.0.weight")
+		b.mlp0W, b.mlp0WQ, _, err = loadMatWeightAuto(ctx, f, p+".mlp.0.weight", 4*int(nTextState), int(nTextState))
 		if err != nil {
 			return nil, err
-		}
-		if len(t.Shape) != 2 {
-			return nil, fmt.Errorf("model: decoder: invalid %s.mlp.0.weight shape %v", p, t.Shape)
-		}
-		if t.Shape[0] == 4*int(nTextState) && t.Shape[1] == int(nTextState) {
-			b.mlp0W = t
-		} else if t.Shape[0] == int(nTextState) && t.Shape[1] == 4*int(nTextState) {
-			b.mlp0W = ml.Transpose(t, 1, 0)
-		} else {
-			return nil, fmt.Errorf("model: decoder: unsupported %s.mlp.0.weight shape %v", p, t.Shape)
 		}
 		if b.mlp0B, _, err = loadTensorAuto(ctx, f, p+".mlp.0.bias"); err != nil {
 			return nil, err
 		}
 
-		// Desired layout for MatMulTransB is [D, 4D].
-		t, _, err = loadTensorAuto(ctx, f, p+".mlp.2.weight")
+		b.mlp2W, b.mlp2WQ, _, err = loadMatWeightAuto(ctx, f, p+".mlp.2.weight", int(nTextState), 4*int(nTextState))
 		if err != nil {
 			return nil, err
-		}
-		if len(t.Shape) != 2 {
-			return nil, fmt.Errorf("model: decoder: invalid %s.mlp.2.weight shape %v", p, t.Shape)
-		}
-		if t.Shape[0] == int(nTextState) && t.Shape[1] == 4*int(nTextState) {
-			b.mlp2W = t
-		} else if t.Shape[0] == 4*int(nTextState) && t.Shape[1] == int(nTextState) {
-			b.mlp2W = ml.Transpose(t, 1, 0)
-		} else {
-			return nil, fmt.Errorf("model: decoder: unsupported %s.mlp.2.weight shape %v", p, t.Shape)
 		}
 		if b.mlp2B, _, err = loadTensorAuto(ctx, f, p+".mlp.2.bias"); err != nil {
 			return nil, err
@@ -689,7 +681,7 @@ func (d *WhisperDecoder) forward(ctx context.Context, state *decoderState, encod
 	}
 
 	// Project to vocabulary: x @ tokenEmb^T → [1, nVocab]
-	if err := ml.MatMulTransBInto(ctx, x, d.tokenEmb, state.scratch.logits); err != nil {
+	if err := matMulTransBMaybeQuantInto(ctx, x, d.tokenEmb, d.tokenEmbQ, state.scratch.logits); err != nil {
 		return nil, fmt.Errorf("model: decode: forward: logits: %w", err)
 	}
 	logits := state.scratch.logits
@@ -710,18 +702,18 @@ func (d *WhisperDecoder) runDecoderSelfAttn(ctx context.Context, state *decoderS
 	sc := &state.scratch
 
 	// Compute Q: x @ qW^T + qB → [1, nTextState]
-	if err := ml.MatMulTransBInto(ctx, x, attn.qW, sc.q); err != nil {
+	if err := matMulTransBMaybeQuantInto(ctx, x, attn.qW, attn.qWQ, sc.q); err != nil {
 		return ml.Tensor{}, fmt.Errorf("model: decode: self_attn: q matmul: %w", err)
 	}
 	addBiasRowInPlace(sc.q, attn.qB)
 
 	// Compute K: x @ kW^T → [1, nTextState]
-	if err := ml.MatMulTransBInto(ctx, x, attn.kW, sc.k); err != nil {
+	if err := matMulTransBMaybeQuantInto(ctx, x, attn.kW, attn.kWQ, sc.k); err != nil {
 		return ml.Tensor{}, fmt.Errorf("model: decode: self_attn: k matmul: %w", err)
 	}
 
 	// Compute V: x @ vW^T + vB → [1, nTextState]
-	if err := ml.MatMulTransBInto(ctx, x, attn.vW, sc.v); err != nil {
+	if err := matMulTransBMaybeQuantInto(ctx, x, attn.vW, attn.vWQ, sc.v); err != nil {
 		return ml.Tensor{}, fmt.Errorf("model: decode: self_attn: v matmul: %w", err)
 	}
 	addBiasRowInPlace(sc.v, attn.vB)
@@ -769,7 +761,7 @@ func (d *WhisperDecoder) runDecoderSelfAttn(ctx context.Context, state *decoderS
 	attnOut := sc.attn.Reshape(1, d.nHead*headDim)
 
 	// Project output: attnOut @ outW^T + outB → [1, nTextState]
-	if err := ml.MatMulTransBInto(ctx, attnOut, attn.outW, sc.out); err != nil {
+	if err := matMulTransBMaybeQuantInto(ctx, attnOut, attn.outW, attn.outWQ, sc.out); err != nil {
 		return ml.Tensor{}, fmt.Errorf("model: decode: self_attn: out matmul: %w", err)
 	}
 
@@ -784,7 +776,7 @@ func (d *WhisperDecoder) runDecoderCrossAttn(ctx context.Context, state *decoder
 	sc := &state.scratch
 
 	// Compute Q: x @ qW^T + qB → [1, nTextState]
-	if err := ml.MatMulTransBInto(ctx, x, attn.qW, sc.q); err != nil {
+	if err := matMulTransBMaybeQuantInto(ctx, x, attn.qW, attn.qWQ, sc.q); err != nil {
 		return ml.Tensor{}, fmt.Errorf("model: decode: cross_attn: q matmul: %w", err)
 	}
 	addBiasRowInPlace(sc.q, attn.qB)
@@ -793,10 +785,10 @@ func (d *WhisperDecoder) runDecoderCrossAttn(ctx context.Context, state *decoder
 		encLen := encoderOut.Shape[0]
 		state.crossK[layerIdx] = ml.New(encLen, d.nTextState)
 		state.crossV[layerIdx] = ml.New(encLen, d.nTextState)
-		if err := ml.MatMulTransBInto(ctx, encoderOut, attn.kW, state.crossK[layerIdx]); err != nil {
+		if err := matMulTransBMaybeQuantInto(ctx, encoderOut, attn.kW, attn.kWQ, state.crossK[layerIdx]); err != nil {
 			return ml.Tensor{}, fmt.Errorf("model: decode: cross_attn: k matmul: %w", err)
 		}
-		if err := ml.MatMulTransBInto(ctx, encoderOut, attn.vW, state.crossV[layerIdx]); err != nil {
+		if err := matMulTransBMaybeQuantInto(ctx, encoderOut, attn.vW, attn.vWQ, state.crossV[layerIdx]); err != nil {
 			return ml.Tensor{}, fmt.Errorf("model: decode: cross_attn: v matmul: %w", err)
 		}
 		for i := 0; i < encLen; i++ {
@@ -832,7 +824,7 @@ func (d *WhisperDecoder) runDecoderCrossAttn(ctx context.Context, state *decoder
 	attnOut := sc.attn.Reshape(1, d.nHead*headDim)
 
 	// Project output: attnOut @ outW^T + outB → [1, nTextState]
-	if err := ml.MatMulTransBInto(ctx, attnOut, attn.outW, sc.out); err != nil {
+	if err := matMulTransBMaybeQuantInto(ctx, attnOut, attn.outW, attn.outWQ, sc.out); err != nil {
 		return ml.Tensor{}, fmt.Errorf("model: decode: cross_attn: out matmul: %w", err)
 	}
 
@@ -847,14 +839,14 @@ func (d *WhisperDecoder) runMLP(ctx context.Context, state *decoderState, x ml.T
 	sc := &state.scratch
 
 	// MLP.0: x @ mlp0W^T + mlp0B → [1, 4*nTextState]
-	if err := ml.MatMulTransBInto(ctx, x, b.mlp0W, sc.mlpH); err != nil {
+	if err := matMulTransBMaybeQuantInto(ctx, x, b.mlp0W, b.mlp0WQ, sc.mlpH); err != nil {
 		return ml.Tensor{}, fmt.Errorf("model: decode: mlp.0: %w", err)
 	}
 	addBiasRowInPlace(sc.mlpH, b.mlp0B)
 	ml.GELUInPlace(sc.mlpH)
 
 	// MLP.2: out @ mlp2W^T + mlp2B → [1, nTextState]
-	if err := ml.MatMulTransBInto(ctx, sc.mlpH, b.mlp2W, sc.out); err != nil {
+	if err := matMulTransBMaybeQuantInto(ctx, sc.mlpH, b.mlp2W, b.mlp2WQ, sc.out); err != nil {
 		return ml.Tensor{}, fmt.Errorf("model: decode: mlp.2: %w", err)
 	}
 

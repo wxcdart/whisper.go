@@ -12,19 +12,25 @@ const layerNormEps = float32(1e-5)
 
 // selfAttn holds Q/K/V/out weight and bias tensors for one self-attention layer.
 type selfAttn struct {
-	qW, qB    ml.Tensor // [nAudioState, nAudioState], [nAudioState]
-	kW        ml.Tensor // [nAudioState, nAudioState] (no bias)
-	vW, vB    ml.Tensor // [nAudioState, nAudioState], [nAudioState]
+	qW, qB     ml.Tensor // [nAudioState, nAudioState], [nAudioState]
+	qWQ        *ml.QuantizedMatrix
+	kW         ml.Tensor // [nAudioState, nAudioState] (no bias)
+	kWQ        *ml.QuantizedMatrix
+	vW, vB     ml.Tensor // [nAudioState, nAudioState], [nAudioState]
+	vWQ        *ml.QuantizedMatrix
 	outW, outB ml.Tensor // [nAudioState, nAudioState], [nAudioState]
+	outWQ      *ml.QuantizedMatrix
 }
 
 // encoderBlock holds all weight tensors for one transformer encoder block.
 type encoderBlock struct {
 	attnLnW, attnLnB ml.Tensor // [nAudioState]
-	attn              selfAttn
+	attn             selfAttn
 	mlpLnW, mlpLnB   ml.Tensor // [nAudioState]
 	mlp0W, mlp0B     ml.Tensor // [4*nAudioState, nAudioState], [4*nAudioState]
+	mlp0WQ           *ml.QuantizedMatrix
 	mlp2W, mlp2B     ml.Tensor // [nAudioState, 4*nAudioState], [nAudioState]
+	mlp2WQ           *ml.QuantizedMatrix
 }
 
 // WhisperEncoder implements the Encoder interface.
@@ -35,10 +41,10 @@ type WhisperEncoder struct {
 	nAudioLayer int
 	nAudioCtx   int
 
-	conv1W, conv1B  ml.Tensor // [nAudioState, nMels, 3], [nAudioState]
-	conv2W, conv2B  ml.Tensor // [nAudioState, nAudioState, 3], [nAudioState]
-	posEmb          ml.Tensor // [nAudioCtx, nAudioState]
-	blocks          []encoderBlock
+	conv1W, conv1B   ml.Tensor // [nAudioState, nMels, 3], [nAudioState]
+	conv2W, conv2B   ml.Tensor // [nAudioState, nAudioState, 3], [nAudioState]
+	posEmb           ml.Tensor // [nAudioCtx, nAudioState]
+	blocks           []encoderBlock
 	lnPostW, lnPostB ml.Tensor // [nAudioState]
 }
 
@@ -199,22 +205,22 @@ func NewEncoder(f *gguf.File) (*WhisperEncoder, error) {
 			return nil, err
 		}
 		// Attention weights are [nAudioState, nAudioState] — used directly with MatMulTransB.
-		if b.attn.qW, _, err = loadTensorAuto(ctx, f, p+".attn.query.weight"); err != nil {
+		if b.attn.qW, b.attn.qWQ, _, err = loadMatWeightAuto(ctx, f, p+".attn.query.weight", int(nAudioState), int(nAudioState)); err != nil {
 			return nil, err
 		}
 		if b.attn.qB, _, err = loadTensorAuto(ctx, f, p+".attn.query.bias"); err != nil {
 			return nil, err
 		}
-		if b.attn.kW, _, err = loadTensorAuto(ctx, f, p+".attn.key.weight"); err != nil {
+		if b.attn.kW, b.attn.kWQ, _, err = loadMatWeightAuto(ctx, f, p+".attn.key.weight", int(nAudioState), int(nAudioState)); err != nil {
 			return nil, err
 		}
-		if b.attn.vW, _, err = loadTensorAuto(ctx, f, p+".attn.value.weight"); err != nil {
+		if b.attn.vW, b.attn.vWQ, _, err = loadMatWeightAuto(ctx, f, p+".attn.value.weight", int(nAudioState), int(nAudioState)); err != nil {
 			return nil, err
 		}
 		if b.attn.vB, _, err = loadTensorAuto(ctx, f, p+".attn.value.bias"); err != nil {
 			return nil, err
 		}
-		if b.attn.outW, _, err = loadTensorAuto(ctx, f, p+".attn.out.weight"); err != nil {
+		if b.attn.outW, b.attn.outWQ, _, err = loadMatWeightAuto(ctx, f, p+".attn.out.weight", int(nAudioState), int(nAudioState)); err != nil {
 			return nil, err
 		}
 		if b.attn.outB, _, err = loadTensorAuto(ctx, f, p+".attn.out.bias"); err != nil {
@@ -226,39 +232,17 @@ func NewEncoder(f *gguf.File) (*WhisperEncoder, error) {
 		if b.mlpLnB, _, err = loadTensorAuto(ctx, f, p+".mlp_ln.bias"); err != nil {
 			return nil, err
 		}
-		// Desired layout for MatMulTransB is [4D, D].
-		t, _, err = loadTensorAuto(ctx, f, p+".mlp.0.weight")
+		b.mlp0W, b.mlp0WQ, _, err = loadMatWeightAuto(ctx, f, p+".mlp.0.weight", 4*int(nAudioState), int(nAudioState))
 		if err != nil {
 			return nil, err
-		}
-		if len(t.Shape) != 2 {
-			return nil, fmt.Errorf("model: encoder: invalid %s.mlp.0.weight shape %v", p, t.Shape)
-		}
-		if t.Shape[0] == 4*int(nAudioState) && t.Shape[1] == int(nAudioState) {
-			b.mlp0W = t
-		} else if t.Shape[0] == int(nAudioState) && t.Shape[1] == 4*int(nAudioState) {
-			b.mlp0W = ml.Transpose(t, 1, 0)
-		} else {
-			return nil, fmt.Errorf("model: encoder: unsupported %s.mlp.0.weight shape %v", p, t.Shape)
 		}
 
 		if b.mlp0B, _, err = loadTensorAuto(ctx, f, p+".mlp.0.bias"); err != nil {
 			return nil, err
 		}
-		// Desired layout for MatMulTransB is [D, 4D].
-		t, _, err = loadTensorAuto(ctx, f, p+".mlp.2.weight")
+		b.mlp2W, b.mlp2WQ, _, err = loadMatWeightAuto(ctx, f, p+".mlp.2.weight", int(nAudioState), 4*int(nAudioState))
 		if err != nil {
 			return nil, err
-		}
-		if len(t.Shape) != 2 {
-			return nil, fmt.Errorf("model: encoder: invalid %s.mlp.2.weight shape %v", p, t.Shape)
-		}
-		if t.Shape[0] == int(nAudioState) && t.Shape[1] == 4*int(nAudioState) {
-			b.mlp2W = t
-		} else if t.Shape[0] == 4*int(nAudioState) && t.Shape[1] == int(nAudioState) {
-			b.mlp2W = ml.Transpose(t, 1, 0)
-		} else {
-			return nil, fmt.Errorf("model: encoder: unsupported %s.mlp.2.weight shape %v", p, t.Shape)
 		}
 
 		if b.mlp2B, _, err = loadTensorAuto(ctx, f, p+".mlp.2.bias"); err != nil {
@@ -349,20 +333,20 @@ func (e *WhisperEncoder) Encode(ctx context.Context, mel ml.Tensor) (ml.Tensor, 
 // x has shape [T, nAudioState]; returns [T, nAudioState].
 func (e *WhisperEncoder) runSelfAttn(ctx context.Context, x ml.Tensor, a selfAttn, T, headDim int) (ml.Tensor, error) {
 	// Q = x @ qW^T + qB
-	Q, err := ml.MatMulTransB(ctx, x, a.qW)
+	Q, err := matMulTransBMaybeQuant(ctx, x, a.qW, a.qWQ)
 	if err != nil {
 		return ml.Tensor{}, fmt.Errorf("attn Q: %w", err)
 	}
 	Q = ml.Add(Q, a.qB)
 
 	// K = x @ kW^T (no bias)
-	K, err := ml.MatMulTransB(ctx, x, a.kW)
+	K, err := matMulTransBMaybeQuant(ctx, x, a.kW, a.kWQ)
 	if err != nil {
 		return ml.Tensor{}, fmt.Errorf("attn K: %w", err)
 	}
 
 	// V = x @ vW^T + vB
-	V, err := ml.MatMulTransB(ctx, x, a.vW)
+	V, err := matMulTransBMaybeQuant(ctx, x, a.vW, a.vWQ)
 	if err != nil {
 		return ml.Tensor{}, fmt.Errorf("attn V: %w", err)
 	}
@@ -383,7 +367,7 @@ func (e *WhisperEncoder) runSelfAttn(ctx context.Context, x ml.Tensor, a selfAtt
 	attnOut = ml.Transpose(attnOut, 1, 0, 2).Reshape(T, e.nAudioState)
 
 	// Output projection: attnOut @ outW^T + outB.
-	out, err := ml.MatMulTransB(ctx, attnOut, a.outW)
+	out, err := matMulTransBMaybeQuant(ctx, attnOut, a.outW, a.outWQ)
 	if err != nil {
 		return ml.Tensor{}, fmt.Errorf("attn out: %w", err)
 	}
@@ -395,7 +379,7 @@ func (e *WhisperEncoder) runSelfAttn(ctx context.Context, x ml.Tensor, a selfAtt
 // x has shape [T, nAudioState]; returns [T, nAudioState].
 func (e *WhisperEncoder) runMLP(ctx context.Context, x ml.Tensor, b *encoderBlock) (ml.Tensor, error) {
 	// Linear 1: [T, D] → [T, 4D]
-	h, err := ml.MatMulTransB(ctx, x, b.mlp0W)
+	h, err := matMulTransBMaybeQuant(ctx, x, b.mlp0W, b.mlp0WQ)
 	if err != nil {
 		return ml.Tensor{}, fmt.Errorf("mlp linear1: %w", err)
 	}
@@ -403,7 +387,7 @@ func (e *WhisperEncoder) runMLP(ctx context.Context, x ml.Tensor, b *encoderBloc
 	h = ml.GELU(h)
 
 	// Linear 2: [T, 4D] → [T, D]
-	out, err := ml.MatMulTransB(ctx, h, b.mlp2W)
+	out, err := matMulTransBMaybeQuant(ctx, h, b.mlp2W, b.mlp2WQ)
 	if err != nil {
 		return ml.Tensor{}, fmt.Errorf("mlp linear2: %w", err)
 	}
