@@ -59,6 +59,53 @@ func BenchmarkDecoderForwardTokenLatency_SoftmaxModes(b *testing.B) {
 	})
 }
 
+func BenchmarkDecoderForwardTokenLatency_TimedBackend(b *testing.B) {
+	ctx := context.Background()
+	decoder := buildTestDecoder()
+	timed := NewTimedBackend(nil)
+	decoder.backend = timed
+
+	encLen := 64
+	encoderOut := ml.New(encLen, testNTextState)
+	for i := range encoderOut.Data {
+		encoderOut.Data[i] = 0.01
+	}
+
+	makeState := func() *decoderState {
+		return decoder.newDecoderState([]int32{50258, 50259, 50357, 50363})
+	}
+
+	state := makeState()
+	timed.Reset()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		logits, err := decoder.forward(ctx, state, encoderOut)
+		if err != nil {
+			b.Fatalf("forward failed: %v", err)
+		}
+		next := int32(i % decoder.nVocab)
+		if len(logits) > 0 && logits[0] > 0 {
+			next = 0
+		}
+		state.tokens = append(state.tokens, next)
+		if len(state.tokens) >= decoder.nTextCtx {
+			state = makeState()
+		}
+	}
+	b.StopTimer()
+
+	stats := timed.Snapshot()
+	for _, op := range []string{"MatMulTransBInto", "ScaledDotProductAttentionInto", "LayerNormInto", "GELUInPlace", "ShouldUseQuantMatMul"} {
+		s := stats[op]
+		if s.Calls == 0 {
+			continue
+		}
+		b.ReportMetric(float64(s.Calls)/float64(b.N), fmt.Sprintf("%s_calls/op", op))
+		b.ReportMetric(float64(s.Total.Microseconds())/1000.0/float64(b.N), fmt.Sprintf("%s_ms/op", op))
+	}
+}
+
 func BenchmarkDecoderSamplingOnly(b *testing.B) {
 	decoder := buildTestDecoder()
 
