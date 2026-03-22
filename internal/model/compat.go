@@ -17,15 +17,54 @@ func resolveTensorName(f gguf.FileLike, name string) (string, bool) {
 		return name, true
 	}
 
-	alt := mapTensorName(name)
-	if alt == "" {
-		return "", false
-	}
-	if _, ok := f.TensorType(alt); ok {
-		return alt, true
+	for _, alt := range mapTensorNames(name) {
+		if alt == "" || alt == name {
+			continue
+		}
+		if _, ok := f.TensorType(alt); ok {
+			return alt, true
+		}
 	}
 
 	return "", false
+}
+
+func mapTensorNames(name string) []string {
+	if strings.HasPrefix(name, "decoder.blocks.") {
+		i, suffix, ok := parseIndexedSuffix(name, "decoder.blocks.")
+		if ok {
+			legacyBase := "decoder.blocks." + strconv.Itoa(i) + "."
+			hfBase := "model.decoder.layers." + strconv.Itoa(i) + "."
+
+			// For decoder self-attention, support both legacy ggml and HF-style GGUF names.
+			switch suffix {
+			case "self_attn_ln.weight":
+				return []string{legacyBase + "attn_ln.weight", hfBase + "self_attn_layer_norm.weight"}
+			case "self_attn_ln.bias":
+				return []string{legacyBase + "attn_ln.bias", hfBase + "self_attn_layer_norm.bias"}
+			case "self_attn.query.weight":
+				return []string{legacyBase + "attn.query.weight", hfBase + "self_attn.q_proj.weight"}
+			case "self_attn.query.bias":
+				return []string{legacyBase + "attn.query.bias", hfBase + "self_attn.q_proj.bias"}
+			case "self_attn.key.weight":
+				return []string{legacyBase + "attn.key.weight", hfBase + "self_attn.k_proj.weight"}
+			case "self_attn.value.weight":
+				return []string{legacyBase + "attn.value.weight", hfBase + "self_attn.v_proj.weight"}
+			case "self_attn.value.bias":
+				return []string{legacyBase + "attn.value.bias", hfBase + "self_attn.v_proj.bias"}
+			case "self_attn.out.weight":
+				return []string{legacyBase + "attn.out.weight", hfBase + "self_attn.out_proj.weight"}
+			case "self_attn.out.bias":
+				return []string{legacyBase + "attn.out.bias", hfBase + "self_attn.out_proj.bias"}
+			}
+		}
+	}
+
+	if mapped := mapTensorName(name); mapped != "" {
+		return []string{mapped}
+	}
+
+	return nil
 }
 
 func mapTensorName(name string) string {

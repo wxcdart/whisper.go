@@ -157,6 +157,11 @@ func parseBin(f *os.File) (*binFile, error) {
 		offset uint64
 	})
 	names := make([]string, 0, 512)
+	fileInfo, err := f.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("legacy bin: stat file: %w", err)
+	}
+	fileSize := fileInfo.Size()
 
 	for {
 		var nDims, nameLen, ftype uint32
@@ -215,7 +220,21 @@ func parseBin(f *os.File) (*binFile, error) {
 		if err != nil {
 			return nil, fmt.Errorf("legacy bin: tensor %q raw size: %w", name, err)
 		}
-		if _, err := f.Seek(int64(rawBytes), io.SeekCurrent); err != nil {
+
+		// Some legacy writers align tensor data to 32 bytes. Probe both layouts and
+		// pick the one that yields a plausible next tensor header.
+		alignedOffset := align32(dataOffset)
+		if alignedOffset > dataOffset {
+			nextNoAlign := dataOffset + int64(rawBytes)
+			nextAlign := alignedOffset + int64(rawBytes)
+			noAlignOK := probeNextTensorHeader(f, nextNoAlign, fileSize)
+			alignOK := probeNextTensorHeader(f, nextAlign, fileSize)
+			if alignOK && !noAlignOK {
+				dataOffset = alignedOffset
+			}
+		}
+
+		if _, err := f.Seek(dataOffset+int64(rawBytes), io.SeekStart); err != nil {
 			return nil, fmt.Errorf("legacy bin: skip tensor %q data: %w", name, err)
 		}
 
@@ -234,6 +253,47 @@ func parseBin(f *os.File) (*binFile, error) {
 	}
 
 	return &binFile{f: f, meta: meta, names: names, tdmap: tdmap}, nil
+}
+
+func align32(v int64) int64 {
+	const align = int64(32)
+	if v%align == 0 {
+		return v
+	}
+	return ((v / align) + 1) * align
+}
+
+func isKnownLegacyDType(v uint32) bool {
+	switch v {
+	case 0, 1, 2, 3, 6, 7, 8, 12:
+		return true
+	default:
+		return false
+	}
+}
+
+func probeNextTensorHeader(f *os.File, offset, fileSize int64) bool {
+	// End-of-file is valid (we're at the final tensor).
+	if offset >= fileSize {
+		return true
+	}
+	buf := make([]byte, 12)
+	if _, err := f.ReadAt(buf, offset); err != nil {
+		return false
+	}
+	nDims := binary.LittleEndian.Uint32(buf[0:4])
+	nameLen := binary.LittleEndian.Uint32(buf[4:8])
+	ftype := binary.LittleEndian.Uint32(buf[8:12])
+	if nDims == 0 || nDims > 8 {
+		return false
+	}
+	if nameLen == 0 || nameLen > 4096 {
+		return false
+	}
+	if !isKnownLegacyDType(ftype) {
+		return false
+	}
+	return true
 }
 
 // Implement gguf.FileLike methods with minimal behaviour.
