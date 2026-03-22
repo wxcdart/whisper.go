@@ -6,6 +6,11 @@ import (
 	"math"
 )
 
+const (
+	QK_K = 256
+	K_SCALE_SIZE = 12
+)
+
 // f16ToF32 converts an IEEE 754 half-precision value to float32.
 func f16ToF32(h uint16) float32 {
 	s := uint32(h>>15) << 31
@@ -73,6 +78,12 @@ func dequantize(raw []byte, dtype uint32, numElems uint64) ([]float32, error) {
 		return nil, fmt.Errorf("unsupported dtype: %d", dtype)
 	}
 	return out, nil
+}
+
+// Dequantize converts raw quantised bytes to float32 values. Exported for
+// use by alternative file format adapters (e.g. legacy ggml .bin parser).
+func Dequantize(raw []byte, dtype uint32, numElems uint64) ([]float32, error) {
+	return dequantize(raw, dtype, numElems)
 }
 
 // dequantQ4_0 decodes Q4_0 blocks.
@@ -190,73 +201,76 @@ func dequantQ8_0(raw []byte, out []float32, n int) {
 }
 
 // dequantQ4_K decodes Q4_K blocks (k-quant 4-bit).
-// Super-block layout (148 bytes per 256 elements):
-// Contains 8 sub-blocks with shared scale and dmin values,
-// followed by 128 bytes of quantized nibble data
+// dequantQ4_K decodes Q4_K blocks (k-quant 4-bit).
+// Ported from ggml's `dequantize_row_q4_K` implementation.
+// Super-block layout (144 bytes per 256 elements):
+// [0:2] f16 d | [2:4] f16 dmin | [4:16] 12 bytes scales | [16:144] 128 bytes qs
 func dequantQ4_K(raw []byte, out []float32, n int) {
-	// Process 256 elements at a time (8 blocks of 32)
-	const superBlockSize = 256
-	blockBytes := len(raw) / ((n + superBlockSize - 1) / superBlockSize)
-	if blockBytes < 128 {
-		blockBytes = 148 // default if can't calculate
+	const (
+		superElems  = 256
+		superBytes  = 144
+		scalesStart = 4
+		qsStart     = 16
+	)
+
+	nb := (n + superElems - 1) / superElems
+	outIdx := 0
+
+	getScaleMinK4 := func(j int, scales []byte) (uint8, uint8) {
+		if j < 4 {
+			d := scales[j] & 63
+			m := scales[j+4] & 63
+			return d, m
+		}
+		d := (scales[j+4] & 0xF) | ((scales[j-4] >> 6) << 4)
+		m := (scales[j+4] >> 4) | ((scales[j-0] >> 6) << 4)
+		return d, m
 	}
 
-	sb := 0 // super-block index
-	for pos := 0; pos < n; pos += superBlockSize {
-		blockStart := sb * blockBytes
-		if blockStart+12 > len(raw) {
+	for b := 0; b < nb; b++ {
+		base := b * superBytes
+		if base+qsStart > len(raw) {
 			break
 		}
+		blk := raw[base:]
 
-		blockRaw := raw[blockStart:]
+		d := f16ToF32(binary.LittleEndian.Uint16(blk[0:2]))
+		dmin := f16ToF32(binary.LittleEndian.Uint16(blk[2:4]))
+		scales := blk[scalesStart:scalesStart+K_SCALE_SIZE]
+		qs := blk[qsStart:qsStart+QK_K/2]
 
-		// Read global scale and min
-		d := f16ToF32(binary.LittleEndian.Uint16(blockRaw[0:2]))
-		dmin := f16ToF32(binary.LittleEndian.Uint16(blockRaw[2:4]))
+		is := 0
+		// There are 4 groups of 64 elements; each group consumes 32 bytes from qs
+		for g := 0; g < 4; g++ {
+			// two sub-blocks per group
+			sc0, m0 := getScaleMinK4(is+0, scales)
+			sc1, m1 := getScaleMinK4(is+1, scales)
+			d1 := d * float32(sc0)
+			m1f := dmin * float32(m0)
+			d2 := d * float32(sc1)
+			m2f := dmin * float32(m1)
 
-		// Scales for 8 sub-blocks (packed in various ways depending on exact format)
-		// For simplicity, treat as 2-bit encoded scales
-		var scales [8]int32
-		if len(blockRaw) > 11 {
-			scalesByte0 := blockRaw[4]
-			scalesByte1 := blockRaw[5]
-			for i := 0; i < 8; i++ {
-				if i < 4 {
-					scales[i] = int32((scalesByte0 >> uint(i*2)) & 3)
-				} else {
-					scales[i] = int32((scalesByte1 >> uint((i-4)*2)) & 3)
+			qoff := g * 32
+			// lower nibble values (first 32 outputs)
+			for l := 0; l < 32; l++ {
+				if outIdx >= n {
+					return
 				}
+				v := qs[qoff+l] & 0xF
+				out[outIdx] = d1*float32(v) - m1f
+				outIdx++
 			}
+			// upper nibble values (next 32 outputs)
+			for l := 0; l < 32; l++ {
+				if outIdx >= n {
+					return
+				}
+				v := qs[qoff+l] >> 4
+				out[outIdx] = d2*float32(v) - m2f
+				outIdx++
+			}
+
+			is += 2
 		}
-
-		// Process 8 blocks of 32 elements
-		for subblk := 0; subblk < 8; subblk++ {
-			m := scales[subblk]
-
-			// Calculate actual scale and minimum for this sub-block
-			sd := d * float32(m+1)
-			sm := dmin * float32(m+1)
-
-			// Read quantized data: 16 bytes per sub-block contain 32 4-bit values
-			qsOffset := 12 + subblk*16
-			if qsOffset+16 > len(blockRaw) {
-				break
-			}
-			qs := blockRaw[qsOffset : qsOffset+16]
-
-			// Dequantize the 32 values for this sub-block
-			elemBase := pos + subblk*32
-			for i := 0; i < 16; i++ {
-				if j := elemBase + i*2; j < n {
-					v := int32(qs[i] & 0xF)
-					out[j] = sd*float32(v-8) + sm
-				}
-				if j := elemBase + i*2 + 1; j < n {
-					v := int32(qs[i] >> 4)
-					out[j] = sd*float32(v-8) + sm
-				}
-			}
-		}
-		sb++
 	}
 }

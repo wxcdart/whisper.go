@@ -75,10 +75,9 @@ func rawSize(dtype uint32, n uint64) (uint64, error) {
 	case dtypeQ8_0:
 		return blocks(n) * 34, nil
 	case dtypeQ4_K:
-		// Q4_K: 256-element super-blocks; actual size varies by implementation
-		// Common sizes: 140-160 bytes per 256 elements
-		// Using 148 bytes (standard GGUF implementation with 8 blocks of ~18.5 bytes)
-		return ((n + 255) / 256) * 148, nil
+		// Q4_K: 256-element super-blocks; canonical size is 144 bytes per 256 elements
+		// Layout: 2*f16 + 12 bytes scales + 128 bytes qs = 144
+		return ((n + 255) / 256) * 144, nil
 	default:
 		return 0, fmt.Errorf("unsupported dtype: %d", dtype)
 	}
