@@ -7,7 +7,7 @@ import (
 )
 
 const (
-	QK_K = 256
+	QK_K         = 256
 	K_SCALE_SIZE = 12
 )
 
@@ -236,8 +236,8 @@ func dequantQ4_K(raw []byte, out []float32, n int) {
 
 		d := f16ToF32(binary.LittleEndian.Uint16(blk[0:2]))
 		dmin := f16ToF32(binary.LittleEndian.Uint16(blk[2:4]))
-		scales := blk[scalesStart:scalesStart+K_SCALE_SIZE]
-		qs := blk[qsStart:qsStart+QK_K/2]
+		scales := blk[scalesStart : scalesStart+K_SCALE_SIZE]
+		qs := blk[qsStart : qsStart+QK_K/2]
 
 		is := 0
 		// There are 4 groups of 64 elements; each group consumes 32 bytes from qs

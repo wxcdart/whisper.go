@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"regexp"
 	"strings"
 	"unicode"
 
@@ -206,6 +207,130 @@ func parseBin(f *os.File) (*binFile, error) {
 		}{shape: shape, dtype: dtype, offset: offset}
 	}
 
+	// If heuristics failed to find any tensor descriptors, perform a
+	// tolerant scan of the file for printable name-like strings and try
+	// to parse descriptors located after them. This handles many legacy
+	// `.bin` variants that don't store strictly NUL-terminated names.
+	if len(names) == 0 {
+		// Read entire file into memory for scanning (models are typically
+		// tens of MB — acceptable for a one-time parse operation).
+		fi, err := f.Stat()
+		if err == nil {
+			size := fi.Size()
+			if size > 0 && size < 1<<30 { // guard against absurd sizes
+				buf := make([]byte, size)
+				if _, err := f.Seek(0, io.SeekStart); err == nil {
+					if _, err := io.ReadFull(f, buf); err == nil {
+						// Find candidate names: 6+ printable chars (letters/digits/._)
+						re := regexp.MustCompile("[A-Za-z0-9_.]{6,200}")
+						matches := re.FindAllIndex(buf, -1)
+						seen := make(map[string]struct{})
+						for _, m := range matches {
+							start := m[0]
+							end := m[1]
+							name := string(buf[start:end])
+							// quick filter: require common prefixes used in models
+							if !strings.Contains(name, "encoder") && !strings.Contains(name, "decoder") && !strings.Contains(name, "positional") && !strings.Contains(name, "ln_") && !strings.Contains(name, "conv") {
+								continue
+							}
+							if _, ok := seen[name]; ok {
+								continue
+							}
+							// attempt to parse descriptor just after the matched name
+							// try a few offsets in case of a separator byte
+							var parsed bool
+							for offShift := 0; offShift < 8 && !parsed; offShift++ {
+								p := end + offShift
+								// need at least 4 bytes for ndim
+								if p+4 > len(buf) {
+									break
+								}
+								ndim := binary.LittleEndian.Uint32(buf[p : p+4])
+								if ndim == 0 || ndim > 8 {
+									continue
+								}
+								// ensure enough bytes for dims
+								req := int(p+4) + int(ndim)*4 + 4 + 8
+								if req > len(buf) {
+									continue
+								}
+								shape := make([]uint64, ndim)
+								okShape := true
+								q := p + 4
+								for i := uint32(0); i < ndim; i++ {
+									d := binary.LittleEndian.Uint32(buf[q : q+4])
+									if d == 0 || d > 1_000_000 {
+										okShape = false
+										break
+									}
+									shape[i] = uint64(d)
+									q += 4
+								}
+								if !okShape {
+									continue
+								}
+								dtype := binary.LittleEndian.Uint32(buf[q : q+4])
+								q += 4
+								// offset may be uint64 or uint32; try uint64 first
+								offset := binary.LittleEndian.Uint64(buf[q : q+8])
+								// basic dtype check
+								known := dtype == 0 || dtype == 1 || dtype == 2 || dtype == 3 || dtype == 6 || dtype == 7 || dtype == 8 || dtype == 12
+								if !known || offset == 0 {
+									// try uint32 fallback
+									off32 := binary.LittleEndian.Uint32(buf[q-8 : q-4])
+									if off32 == 0 {
+										continue
+									}
+									offset = uint64(off32)
+								}
+								// offset sanity: must be within file
+								if int64(offset) <= 0 || int64(offset) > fi.Size() {
+									continue
+								}
+								// accept
+								names = append(names, name)
+								tdmap[name] = struct {
+									shape  []uint64
+									dtype  uint32
+									offset uint64
+								}{shape: shape, dtype: dtype, offset: offset}
+								seen[name] = struct{}{}
+								parsed = true
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// Normalize discovered names by cleaning common mangling (trailing
+	// punctuation, non-printable chars) so consumers can look up tensors
+	// by the canonical names used elsewhere in the codebase.
+	if len(names) > 0 {
+		newNames := make([]string, 0, len(names))
+		newTdmap := make(map[string]struct {
+			shape  []uint64
+			dtype  uint32
+			offset uint64
+		})
+		for _, orig := range names {
+			td := tdmap[orig]
+			cleaned := cleanTensorName(orig)
+			if cleaned == "" {
+				// keep original if cleaning produced nothing
+				cleaned = orig
+			}
+			if _, ok := newTdmap[cleaned]; ok {
+				continue
+			}
+			newNames = append(newNames, cleaned)
+			newTdmap[cleaned] = td
+		}
+		names = newNames
+		tdmap = newTdmap
+	}
+
 	return &binFile{f: f, meta: meta, names: names, tdmap: tdmap}, nil
 }
 
@@ -320,6 +445,28 @@ func looksLikeName(s string) bool {
 	return true
 }
 
+// cleanTensorName removes non-alphanumeric, non-dot, non-underscore
+// characters and collapses repeated dots. Used to normalize mangled
+// legacy tensor names (e.g. trailing punctuation introduced by some
+// exporters).
+func cleanTensorName(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '.' || r == '_' {
+			b.WriteRune(r)
+		}
+	}
+	out := b.String()
+	out = strings.Trim(out, ".")
+	if out == "" {
+		return ""
+	}
+	// collapse multiple dots
+	dotRe := regexp.MustCompile(`\.+`)
+	out = dotRe.ReplaceAllString(out, ".")
+	return out
+}
+
 // local helpers for raw size and read (copied/adapted from gguf/tensor.go)
 func blocksLocal(n uint64) uint64 { return (n + 31) / 32 }
 func rawSizeLocal(dtype uint32, n uint64) (uint64, error) {
@@ -339,7 +486,9 @@ func rawSizeLocal(dtype uint32, n uint64) (uint64, error) {
 	case 8:
 		return blocksLocal(n) * 34, nil
 	case 12:
-		return ((n + 255) / 256) * 148, nil
+		// Q4_K (k-quant 4-bit) uses 144 bytes per 256 elements in ggml
+		// canonical layout: 2*f16 + 12 scale bytes + 128 bytes of qs.
+		return ((n + 255) / 256) * 144, nil
 	default:
 		return 0, fmt.Errorf("unsupported dtype: %d", dtype)
 	}
