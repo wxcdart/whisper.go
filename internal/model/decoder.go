@@ -453,7 +453,8 @@ func (d *WhisperDecoder) decodeGreedy(ctx context.Context, encoderOut ml.Tensor,
 			// Make a copy of logits to avoid mutating shared buffers.
 			curLogits := make([]float32, len(logits))
 			copy(curLogits, logits[:d.nVocab])
-			curLogits = applyRepetitionPenalty(curLogits, state.tokens, 1.5)
+			// Tuned values for this model: penalty=2.0, historyWindow=128
+			curLogits = applyRepetitionPenalty(curLogits, state.tokens, 2.0, 128)
 
 			// Sample next token using greedy with temperature and fallback.
 			nextToken, idxTmp, sTmp, err := d.sampleGreedyWithScratch(curLogits, temperature, params, state.scratch.idxTmp, state.scratch.sTmp)
@@ -525,170 +526,203 @@ func (d *WhisperDecoder) decodeGreedy(ctx context.Context, encoderOut ml.Tensor,
 
 // decodeBeamSearch uses beam search to generate tokens.
 func (d *WhisperDecoder) decodeBeamSearch(ctx context.Context, encoderOut ml.Tensor, params DecoderParams) ([]Segment, error) {
-	beamSize := params.BeamSize
-	if beamSize <= 0 {
-		beamSize = 1
+	// Beam search with compression-ratio retry and temperature schedule.
+	baseTemp := params.Temperature
+	if baseTemp == 0 {
+		baseTemp = 1.0
 	}
+	attempts := 3
+	var finalTokens []int32
+	for attempt := 0; attempt < attempts; attempt++ {
+		temperature := baseTemp + float32(attempt)*0.2
 
-	// Initialize beam hypotheses with reusable decoder state.
-	beams := make([]*beam, beamSize)
-	for i := 0; i < beamSize; i++ {
-		beams[i] = &beam{
-			tokens: make([]int32, len(params.Prompt)),
-			score:  0,
-			state:  d.newDecoderState(params.Prompt),
-		}
-		copy(beams[i].tokens, params.Prompt)
-	}
-
-	temperature := params.Temperature
-	if temperature == 0 {
-		temperature = 1.0
-	}
-
-	maxTokens := params.MaxTokens
-	if maxTokens <= 0 {
-		maxTokens = d.nTextCtx
-	}
-	if capFromCtx := d.nTextCtx - len(params.Prompt); capFromCtx < maxTokens {
-		maxTokens = capFromCtx
-	}
-	if maxTokens < 0 {
-		maxTokens = 0
-	}
-
-	allCandidates := make([]beamCandidate, 0, beamSize*6)
-	reusableBeams := make([]*beam, 0, beamSize)
-
-	for step := 0; step < maxTokens; step++ {
-		if err := ctx.Err(); err != nil {
-			return nil, fmt.Errorf("model: decode: beam search cancelled: %w", err)
+		beamSize := params.BeamSize
+		if beamSize <= 0 {
+			beamSize = 1
 		}
 
-		// Compute logits for all beam hypotheses.
-		allCandidates = allCandidates[:0]
-		reusableBeams = reusableBeams[:0]
-
-		for _, hyp := range beams {
-			reusableBeams = append(reusableBeams, hyp)
-			if len(hyp.tokens) > 0 && hyp.tokens[len(hyp.tokens)-1] == d.eotToken {
-				// This hypothesis has reached EOT, keep it unchanged.
-				normScore := hyp.score / float32(math.Pow(float64(len(hyp.tokens)), 0.6))
-				allCandidates = append(allCandidates, beamCandidate{
-					parent:    hyp,
-					score:     hyp.score,
-					token:     d.eotToken,
-					logprob:   0,
-					normScore: normScore,
-				})
-				continue
+		// Initialize beam hypotheses with reusable decoder state.
+		beams := make([]*beam, beamSize)
+		for i := 0; i < beamSize; i++ {
+			beams[i] = &beam{
+				tokens: make([]int32, len(params.Prompt)),
+				score:  0,
+				state:  d.newDecoderState(params.Prompt),
 			}
-
-			d.resetDecoderState(hyp.state, hyp.tokens)
-			logits, err := d.forward(ctx, hyp.state, encoderOut)
-			if err != nil {
-				return nil, fmt.Errorf("model: decode: beam search forward: %w", err)
-			}
-
-			// Apply repetition penalty per hypothesis to logits before selecting candidates.
-			curLogits := make([]float32, d.nVocab)
-			copy(curLogits, logits[:d.nVocab])
-			curLogits = applyRepetitionPenalty(curLogits, hyp.tokens, 1.5)
-
-			// Get top-K candidates from this hypothesis.
-			topK := 5 // Heuristic: keep top 5 candidates per hypothesis.
-			candidates, topBuf := d.topKTokensWithScratch(curLogits, topK, temperature, hyp.state.scratch.topK)
-			hyp.state.scratch.topK = topBuf
-
-			for _, candidate := range candidates {
-				newLen := len(hyp.tokens) + 1
-				newScore := hyp.score + candidate.logprob
-				// Normalize score by sequence length (length penalty).
-				normScore := newScore / float32(math.Pow(float64(newLen), 0.6))
-				allCandidates = append(allCandidates, beamCandidate{
-					parent:    hyp,
-					score:     newScore,
-					token:     candidate.token,
-					logprob:   candidate.logprob,
-					normScore: normScore,
-				})
-			}
+			copy(beams[i].tokens, params.Prompt)
 		}
 
-		// Sort by normalized score and keep top-K.
-		bestCandidates := sortAndPruneBeams(allCandidates, beamSize)
+		maxTokens := params.MaxTokens
+		if maxTokens <= 0 {
+			maxTokens = d.nTextCtx
+		}
+		if capFromCtx := d.nTextCtx - len(params.Prompt); capFromCtx < maxTokens {
+			maxTokens = capFromCtx
+		}
+		if maxTokens < 0 {
+			maxTokens = 0
+		}
 
-		// Update beams with top candidates.
-		nextBeams := make([]*beam, len(bestCandidates))
-		for i, cand := range bestCandidates {
-			var nb *beam
-			if n := len(reusableBeams); n > 0 {
-				nb = reusableBeams[n-1]
-				reusableBeams = reusableBeams[:n-1]
-			} else {
-				nb = &beam{state: d.newDecoderState(nil)}
+		allCandidates := make([]beamCandidate, 0, beamSize*6)
+		reusableBeams := make([]*beam, 0, beamSize)
+
+		for step := 0; step < maxTokens; step++ {
+			if err := ctx.Err(); err != nil {
+				return nil, fmt.Errorf("model: decode: beam search cancelled: %w", err)
 			}
 
-			if len(cand.parent.tokens) > 0 && cand.parent.tokens[len(cand.parent.tokens)-1] == d.eotToken && cand.token == d.eotToken && cand.logprob == 0 {
-				if cap(nb.tokens) < len(cand.parent.tokens) {
-					nb.tokens = make([]int32, len(cand.parent.tokens))
-				} else {
-					nb.tokens = nb.tokens[:len(cand.parent.tokens)]
+			// Compute logits for all beam hypotheses.
+			allCandidates = allCandidates[:0]
+			reusableBeams = reusableBeams[:0]
+
+			for _, hyp := range beams {
+				reusableBeams = append(reusableBeams, hyp)
+				if len(hyp.tokens) > 0 && hyp.tokens[len(hyp.tokens)-1] == d.eotToken {
+					// This hypothesis has reached EOT, keep it unchanged.
+					normScore := hyp.score / float32(math.Pow(float64(len(hyp.tokens)), 0.6))
+					allCandidates = append(allCandidates, beamCandidate{
+						parent:    hyp,
+						score:     hyp.score,
+						token:     d.eotToken,
+						logprob:   0,
+						normScore: normScore,
+					})
+					continue
 				}
-				copy(nb.tokens, cand.parent.tokens)
-			} else {
-				newLen := len(cand.parent.tokens) + 1
-				if cap(nb.tokens) < newLen {
-					nb.tokens = make([]int32, newLen)
-				} else {
-					nb.tokens = nb.tokens[:newLen]
+
+				d.resetDecoderState(hyp.state, hyp.tokens)
+				logits, err := d.forward(ctx, hyp.state, encoderOut)
+				if err != nil {
+					return nil, fmt.Errorf("model: decode: beam search forward: %w", err)
 				}
-				copy(nb.tokens, cand.parent.tokens)
-				nb.tokens[newLen-1] = cand.token
+
+				// Apply repetition penalty per hypothesis to logits before selecting candidates.
+				curLogits := make([]float32, d.nVocab)
+				copy(curLogits, logits[:d.nVocab])
+				// Tuned values for this model: penalty=2.0, historyWindow=128
+				curLogits = applyRepetitionPenalty(curLogits, hyp.tokens, 2.0, 128)
+
+				// Get top-K candidates from this hypothesis.
+				topK := 5 // Heuristic: keep top 5 candidates per hypothesis.
+				candidates, topBuf := d.topKTokensWithScratch(curLogits, topK, temperature, hyp.state.scratch.topK)
+				hyp.state.scratch.topK = topBuf
+
+				for _, candidate := range candidates {
+					newLen := len(hyp.tokens) + 1
+					newScore := hyp.score + candidate.logprob
+					// Normalize score by sequence length (length penalty).
+					normScore := newScore / float32(math.Pow(float64(newLen), 0.6))
+					allCandidates = append(allCandidates, beamCandidate{
+						parent:    hyp,
+						score:     newScore,
+						token:     candidate.token,
+						logprob:   candidate.logprob,
+						normScore: normScore,
+					})
+				}
 			}
 
-			nb.score = cand.score
-			nextBeams[i] = nb
-		}
-		beams = nextBeams
+			// Sort by normalized score and keep top-K.
+			bestCandidates := sortAndPruneBeams(allCandidates, beamSize)
 
-		// Check if all hypotheses have reached EOT.
-		allEOT := true
-		for _, hyp := range beams {
-			if len(hyp.tokens) == 0 || hyp.tokens[len(hyp.tokens)-1] != d.eotToken {
-				allEOT = false
-				break
-			}
-		}
-		if allEOT {
-			break
-		}
+			// Update beams with top candidates.
+			nextBeams := make([]*beam, len(bestCandidates))
+			for i, cand := range bestCandidates {
+				var nb *beam
+				if n := len(reusableBeams); n > 0 {
+					nb = reusableBeams[n-1]
+					reusableBeams = reusableBeams[:n-1]
+				} else {
+					nb = &beam{state: d.newDecoderState(nil)}
+				}
 
-		// Safety: if best beam shows excessive repetition, assume stuck and stop.
-		if len(beams) > 0 {
-			best := beams[0]
-			if len(best.tokens) >= 2 {
-				last := best.tokens[len(best.tokens)-1]
-				streak := 1
-				for i := len(best.tokens) - 2; i >= 0 && best.tokens[i] == last; i-- {
-					streak++
-					if streak > 20 {
-						allEOT = true
-						break
+				if len(cand.parent.tokens) > 0 && cand.parent.tokens[len(cand.parent.tokens)-1] == d.eotToken && cand.token == d.eotToken && cand.logprob == 0 {
+					if cap(nb.tokens) < len(cand.parent.tokens) {
+						nb.tokens = make([]int32, len(cand.parent.tokens))
+					} else {
+						nb.tokens = nb.tokens[:len(cand.parent.tokens)]
 					}
+					copy(nb.tokens, cand.parent.tokens)
+				} else {
+					newLen := len(cand.parent.tokens) + 1
+					if cap(nb.tokens) < newLen {
+						nb.tokens = make([]int32, newLen)
+					} else {
+						nb.tokens = nb.tokens[:newLen]
+					}
+					copy(nb.tokens, cand.parent.tokens)
+					nb.tokens[newLen-1] = cand.token
 				}
-				if allEOT {
+
+				nb.score = cand.score
+				nextBeams[i] = nb
+			}
+			beams = nextBeams
+
+			// Check if all hypotheses have reached EOT.
+			allEOT := true
+			for _, hyp := range beams {
+				if len(hyp.tokens) == 0 || hyp.tokens[len(hyp.tokens)-1] != d.eotToken {
+					allEOT = false
 					break
 				}
 			}
+			if allEOT {
+				break
+			}
+
+			// Safety: if best beam shows excessive repetition, assume stuck and stop.
+			if len(beams) > 0 {
+				best := beams[0]
+				if len(best.tokens) >= 2 {
+					last := best.tokens[len(best.tokens)-1]
+					streak := 1
+					for i := len(best.tokens) - 2; i >= 0 && best.tokens[i] == last; i-- {
+						streak++
+						if streak > 20 {
+							allEOT = true
+							break
+						}
+					}
+					if allEOT {
+						break
+					}
+				}
+			}
 		}
+
+		// Return segments from the best beam (first hypothesis).
+		if len(beams) == 0 {
+			finalTokens = []int32{}
+		} else {
+			finalTokens = append([]int32(nil), beams[0].tokens...)
+		}
+
+		// If vocabulary is available, check compression ratio and retry with higher temperature if stuck.
+		if d.vocab != nil && len(finalTokens) > len(params.Prompt) {
+			// Extract non-prompt tokens and decode text.
+			tokIDs := finalTokens[len(params.Prompt):]
+			vtoks := make([]vocab.Token, 0, len(tokIDs))
+			for _, t := range tokIDs {
+				vtoks = append(vtoks, vocab.Token(t))
+			}
+			decoded := d.vocab.Decode(vtoks)
+			if decoded != "" {
+				ratio := compressionRatio(decoded)
+				if ratio > 2.4 && attempt < attempts-1 && !params.NoFallback {
+					// retry with higher temperature
+					continue
+				}
+			}
+		}
+
+		break
 	}
 
-	// Return segments from the best beam (first hypothesis).
-	if len(beams) == 0 {
-		return []Segment{}, nil
+	if finalTokens == nil {
+		finalTokens = []int32{}
 	}
-	return d.tokensToSegments(beams[0].tokens, params.Prompt)
+	return d.tokensToSegments(finalTokens, params.Prompt)
 }
 
 // beam represents a hypothesis in beam search.
@@ -1148,6 +1182,53 @@ func compressionRatio(s string) float32 {
 	return float32(len(s)) / float32(comp)
 }
 
+// collapseRepeatedSubstrings detects short repeated units in `s` and collapses
+// runs where the same unit repeats >= minRepeats times. This helps remove
+// BPE-level repetition like "tra tra tra ..." when merged to text.
+func collapseRepeatedSubstrings(s string, maxUnitLen, minRepeats int) string {
+	if s == "" || maxUnitLen <= 0 || minRepeats <= 1 {
+		return s
+	}
+	n := len(s)
+	// For simplicity operate on bytes (UTF-8 may split, but repeated ASCII runs are common in BPE loops).
+	b := []byte(s)
+	out := make([]byte, 0, n)
+	i := 0
+	for i < n {
+		// Try unit lengths from 1..maxUnitLen (but bounded by remaining length)
+		maxL := maxUnitLen
+		if maxL > n-i {
+			maxL = n - i
+		}
+		collapsed := false
+		for l := 1; l <= maxL; l++ {
+			// Check how many times b[i:i+l] repeats starting at i
+			unit := b[i : i+l]
+			cnt := 1
+			j := i + l
+			for j+l <= n && bytes.Equal(b[j:j+l], unit) {
+				cnt++
+				j += l
+				if cnt >= minRepeats {
+					break
+				}
+			}
+			if cnt >= minRepeats {
+				// append one unit and skip the repeats
+				out = append(out, unit...)
+				i += l * cnt
+				collapsed = true
+				break
+			}
+		}
+		if !collapsed {
+			out = append(out, b[i])
+			i++
+		}
+	}
+	return string(out)
+}
+
 // topKTokens returns the top-K tokens by probability.
 func (d *WhisperDecoder) topKTokens(logits []float32, k int, temperature float32) []struct {
 	token   int32
@@ -1368,8 +1449,10 @@ func (d *WhisperDecoder) tokensToSegments(tokens []int32, prompt []int32) ([]Seg
 	}
 
 	if d.vocab != nil {
-		// Rebuild segment text from filtered token sequence.
+		// Rebuild segment text from filtered token sequence and collapse repeated substrings.
 		segment.Text = d.vocab.Decode(decodedTokens)
+		// Collapse obvious BPE-level repetition runs (tuned parameters).
+		segment.Text = collapseRepeatedSubstrings(segment.Text, 6, 3)
 	}
 
 	return []Segment{segment}, nil
