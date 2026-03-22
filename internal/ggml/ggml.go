@@ -359,7 +359,13 @@ func (b *binFile) TensorNames() []string                   { return b.names }
 func (b *binFile) Tensor(ctx context.Context, name string) ([]float32, []int, error) {
 	td, ok := b.tdmap[name]
 	if !ok {
-		return nil, nil, fmt.Errorf("tensor %q not found", name)
+		// try cleaned variant
+		if cleaned := cleanTensorName(name); cleaned != name {
+			td, ok = b.tdmap[cleaned]
+		}
+		if !ok {
+			return nil, nil, fmt.Errorf("tensor %q not found", name)
+		}
 	}
 	num := uint64(1)
 	for _, d := range td.shape {
@@ -383,7 +389,12 @@ func (b *binFile) Tensor(ctx context.Context, name string) ([]float32, []int, er
 func (b *binFile) TensorRaw(ctx context.Context, name string) ([]byte, []int, gguf.QuantType, error) {
 	td, ok := b.tdmap[name]
 	if !ok {
-		return nil, nil, gguf.QuantF32, fmt.Errorf("tensor %q not found", name)
+		if cleaned := cleanTensorName(name); cleaned != name {
+			td, ok = b.tdmap[cleaned]
+		}
+		if !ok {
+			return nil, nil, gguf.QuantF32, fmt.Errorf("tensor %q not found", name)
+		}
 	}
 	num := uint64(1)
 	for _, d := range td.shape {
@@ -404,7 +415,12 @@ func (b *binFile) TensorRaw(ctx context.Context, name string) ([]byte, []int, gg
 func (b *binFile) TensorType(name string) (gguf.QuantType, bool) {
 	td, ok := b.tdmap[name]
 	if !ok {
-		return gguf.QuantF32, false
+		if cleaned := cleanTensorName(name); cleaned != name {
+			td, ok = b.tdmap[cleaned]
+		}
+		if !ok {
+			return gguf.QuantF32, false
+		}
 	}
 	return gguf.QuantType(td.dtype), true
 }
