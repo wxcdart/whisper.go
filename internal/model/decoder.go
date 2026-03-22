@@ -425,8 +425,8 @@ func (d *WhisperDecoder) decodeGreedy(ctx context.Context, encoderOut ml.Tensor,
 	// Allow a few attempts with increasing temperature if decoder appears stuck
 	attempts := 3
 	baseTemp := params.Temperature
-	if baseTemp == 0 {
-		baseTemp = 1.0
+	if baseTemp < 0 {
+		baseTemp = 0
 	}
 
 	maxTokens := params.MaxTokens
@@ -539,8 +539,8 @@ func (d *WhisperDecoder) decodeGreedy(ctx context.Context, encoderOut ml.Tensor,
 func (d *WhisperDecoder) decodeBeamSearch(ctx context.Context, encoderOut ml.Tensor, params DecoderParams) ([]Segment, error) {
 	// Beam search with compression-ratio retry and temperature schedule.
 	baseTemp := params.Temperature
-	if baseTemp == 0 {
-		baseTemp = 1.0
+	if baseTemp < 0 {
+		baseTemp = 0
 	}
 	attempts := 3
 	var finalTokens []int32
