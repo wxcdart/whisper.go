@@ -31,13 +31,13 @@ func writeWAV(t *testing.T, samples []int16, channels int, sampleRate int) strin
 	write(totalSize)
 	f.Write([]byte("WAVE"))
 	f.Write([]byte("fmt "))
-	write(uint32(16))          // chunk size
-	write(uint16(1))           // PCM
-	write(uint16(channels))    // num channels
-	write(uint32(sampleRate))  // sample rate
+	write(uint32(16))                                        // chunk size
+	write(uint16(1))                                         // PCM
+	write(uint16(channels))                                  // num channels
+	write(uint32(sampleRate))                                // sample rate
 	write(uint32(uint32(sampleRate) * uint32(channels) * 2)) // byte rate
-	write(uint16(uint16(channels) * 2)) // block align
-	write(uint16(16))          // bits per sample
+	write(uint16(uint16(channels) * 2))                      // block align
+	write(uint16(16))                                        // bits per sample
 	f.Write([]byte("data"))
 	write(dataSize)
 	for _, s := range samples {

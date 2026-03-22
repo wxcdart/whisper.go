@@ -6,15 +6,16 @@ import (
 	"testing"
 
 	"github.com/whispergo/whisper.go/internal/ml"
+	"github.com/whispergo/whisper.go/internal/vocab"
 )
 
 const (
-	testNVocab       = 51865 // Realistic Whisper vocab size
-	testNTextState   = 4
-	testNTextHead    = 2
-	testNTextLayer   = 1
-	testNTextCtx     = 128
-	testTextHeadDim  = testNTextState / testNTextHead // 2
+	testNVocab      = 51865 // Realistic Whisper vocab size
+	testNTextState  = 4
+	testNTextHead   = 2
+	testNTextLayer  = 1
+	testNTextCtx    = 128
+	testTextHeadDim = testNTextState / testNTextHead // 2
 )
 
 // buildTestDecoder constructs a WhisperDecoder with tiny dimensions and nonzero weights.
@@ -87,7 +88,7 @@ func buildTestDecoder() *WhisperDecoder {
 // TestDecode_Greedy_OutputSegments verifies that greedy decoding produces non-empty segments.
 func TestDecode_Greedy_OutputSegments(t *testing.T) {
 	decoder := buildTestDecoder()
-	
+
 	// Create mock encoder output [T, nTextState]
 	encLen := 8
 	encoderOut := ml.New(encLen, testNTextState)
@@ -98,7 +99,7 @@ func TestDecode_Greedy_OutputSegments(t *testing.T) {
 	// Set up minimal decoder parameters with a prompt.
 	params := DecoderParams{
 		Prompt:      []int32{50258, 50259, 50357, 50363}, // Example Whisper prompt
-		BeamSize:    1, // Greedy
+		BeamSize:    1,                                   // Greedy
 		MaxTokens:   5,
 		Temperature: 1.0,
 	}
@@ -175,5 +176,35 @@ func TestDecode_BeamSearch(t *testing.T) {
 
 	if len(segments) == 0 {
 		t.Error("expected at least one segment from beam search")
+	}
+}
+
+func TestTokensToSegments_DecodesText(t *testing.T) {
+	decoder := buildTestDecoder()
+
+	v, err := vocab.New(
+		[]string{"a", "b", "<|endoftext|>"},
+		[]uint32{0, 0, 1},
+	)
+	if err != nil {
+		t.Fatalf("vocab.New error: %v", err)
+	}
+	decoder.SetVocabulary(v)
+
+	segments, err := decoder.tokensToSegments([]int32{99, 0, 1}, []int32{99})
+	if err != nil {
+		t.Fatalf("tokensToSegments error: %v", err)
+	}
+	if len(segments) != 1 {
+		t.Fatalf("expected 1 segment, got %d", len(segments))
+	}
+	if segments[0].Text != "ab" {
+		t.Fatalf("segment text = %q, want %q", segments[0].Text, "ab")
+	}
+	if len(segments[0].Tokens) != 2 {
+		t.Fatalf("expected 2 tokens, got %d", len(segments[0].Tokens))
+	}
+	if segments[0].Tokens[0].Text != "a" || segments[0].Tokens[1].Text != "b" {
+		t.Fatalf("unexpected token texts: %+v", segments[0].Tokens)
 	}
 }

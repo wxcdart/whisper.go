@@ -25,10 +25,10 @@ type SileroVAD struct {
 	encoderBiases  []ml.Tensor // [layer][outC]
 
 	// LSTM parameters
-	lstmInputWeight  ml.Tensor  // [4*hidden, input] for 4 gates (input, forget, cell, output)
-	lstmHiddenWeight ml.Tensor  // [4*hidden, hidden]
-	lstmBias         ml.Tensor  // [4*hidden]
-	lstmHidden       int        // hidden dimension (64)
+	lstmInputWeight  ml.Tensor // [4*hidden, input] for 4 gates (input, forget, cell, output)
+	lstmHiddenWeight ml.Tensor // [4*hidden, hidden]
+	lstmBias         ml.Tensor // [4*hidden]
+	lstmHidden       int       // hidden dimension (64)
 
 	// Classifier: Conv1D(64 -> 1, kernel=1) + Sigmoid
 	classifierWeight ml.Tensor // [1, 64, 1]

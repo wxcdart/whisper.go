@@ -190,4 +190,3 @@ func usage() {
 	fmt.Fprintf(os.Stderr, "  -t, --type    string   quantisation type: q4_0, q4_1, q5_0, q5_1, q8_0, f16 (required)\n")
 	fmt.Fprintf(os.Stderr, "  -v, --verbose          print per-tensor info\n")
 }
-

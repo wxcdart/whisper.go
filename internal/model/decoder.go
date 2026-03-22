@@ -1,14 +1,19 @@
 package model
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"fmt"
+	"io"
 	"math"
 	"math/rand"
 	"sort"
+	"strings"
 
 	"github.com/whispergo/whisper.go/internal/gguf"
 	"github.com/whispergo/whisper.go/internal/ml"
+	"github.com/whispergo/whisper.go/internal/vocab"
 )
 
 // decoderCrossAttn holds Q/K/V/out weights for cross-attention to encoder output.
@@ -73,6 +78,19 @@ type WhisperDecoder struct {
 
 	// Special token IDs
 	eotToken int32
+	vocab    *vocab.Vocabulary
+}
+
+// SetVocabulary attaches vocabulary used to decode token IDs into text.
+func (d *WhisperDecoder) SetVocabulary(v *vocab.Vocabulary) {
+	d.vocab = v
+	if v == nil {
+		return
+	}
+	special := v.Special()
+	if special.EOT >= 0 {
+		d.eotToken = int32(special.EOT)
+	}
 }
 
 // NewDecoder loads a decoder from an open GGUF file.
@@ -393,11 +411,11 @@ func (d *WhisperDecoder) Decode(ctx context.Context, encoderOut ml.Tensor, param
 
 // decodeGreedy uses greedy sampling to generate tokens.
 func (d *WhisperDecoder) decodeGreedy(ctx context.Context, encoderOut ml.Tensor, params DecoderParams) ([]Segment, error) {
-	state := d.newDecoderState(params.Prompt)
-
-	temperature := params.Temperature
-	if temperature == 0 {
-		temperature = 1.0
+	// Allow a few attempts with increasing temperature if decoder appears stuck
+	attempts := 3
+	baseTemp := params.Temperature
+	if baseTemp == 0 {
+		baseTemp = 1.0
 	}
 
 	maxTokens := params.MaxTokens
@@ -411,35 +429,98 @@ func (d *WhisperDecoder) decodeGreedy(ctx context.Context, encoderOut ml.Tensor,
 		maxTokens = 0
 	}
 
-	for len(state.tokens) < len(params.Prompt)+maxTokens {
-		if err := ctx.Err(); err != nil {
-			return nil, fmt.Errorf("model: decode: cancelled: %w", err)
+	var finalTokens []int32
+	for attempt := 0; attempt < attempts; attempt++ {
+		state := d.newDecoderState(params.Prompt)
+		temperature := baseTemp + float32(attempt)*0.2
+
+		// Simple repetition guard: stop if the same token repeats too many times.
+		repeatStreak := 0
+		var prevToken int32 = -1
+
+		for len(state.tokens) < len(params.Prompt)+maxTokens {
+			if err := ctx.Err(); err != nil {
+				return nil, fmt.Errorf("model: decode: cancelled: %w", err)
+			}
+
+			// Compute logits for the next token.
+			logits, err := d.forward(ctx, state, encoderOut)
+			if err != nil {
+				return nil, fmt.Errorf("model: decode: forward: %w", err)
+			}
+
+			// Apply repetition penalty based on recent history before sampling.
+			// Make a copy of logits to avoid mutating shared buffers.
+			curLogits := make([]float32, len(logits))
+			copy(curLogits, logits[:d.nVocab])
+			curLogits = applyRepetitionPenalty(curLogits, state.tokens, 1.5)
+
+			// Sample next token using greedy with temperature and fallback.
+			nextToken, idxTmp, sTmp, err := d.sampleGreedyWithScratch(curLogits, temperature, params, state.scratch.idxTmp, state.scratch.sTmp)
+			if err != nil {
+				return nil, fmt.Errorf("model: decode: sample: %w", err)
+			}
+			state.scratch.idxTmp = idxTmp
+			state.scratch.sTmp = sTmp
+
+			state.tokens = append(state.tokens, nextToken)
+
+			// Stop if we hit EOT.
+			if nextToken == d.eotToken {
+				break
+			}
+
+			// Update repetition streak and stop if it grows too large.
+			if prevToken == nextToken {
+				repeatStreak++
+			} else {
+				repeatStreak = 1
+				prevToken = nextToken
+			}
+			// Heuristic threshold: 20 identical tokens -> consider decoding stuck.
+			if repeatStreak > 20 {
+				break
+			}
 		}
 
-		// Compute logits for the next token.
-		logits, err := d.forward(ctx, state, encoderOut)
-		if err != nil {
-			return nil, fmt.Errorf("model: decode: forward: %w", err)
+		finalTokens = append([]int32(nil), state.tokens...)
+
+		// Check compression ratio for loop detection.
+		if d.vocab != nil {
+			// Build non-prompt token list and decode to text.
+			promptLen := len(params.Prompt)
+			tokIDs := finalTokens
+			if len(tokIDs) > promptLen {
+				tokIDs = tokIDs[promptLen:]
+			} else {
+				tokIDs = nil
+			}
+			var decoded string
+			if len(tokIDs) > 0 {
+				vtoks := make([]vocab.Token, len(tokIDs))
+				for i, t := range tokIDs {
+					vtoks[i] = vocab.Token(t)
+				}
+				decoded = d.vocab.Decode(vtoks)
+			}
+
+			if decoded != "" {
+				ratio := compressionRatio(decoded)
+				if ratio > 2.4 && attempt < attempts-1 && !params.NoFallback {
+					// retry with higher temperature
+					continue
+				}
+			}
 		}
 
-		// Sample next token using greedy with temperature and fallback.
-		nextToken, idxTmp, sTmp, err := d.sampleGreedyWithScratch(logits, temperature, params, state.scratch.idxTmp, state.scratch.sTmp)
-		if err != nil {
-			return nil, fmt.Errorf("model: decode: sample: %w", err)
-		}
-		state.scratch.idxTmp = idxTmp
-		state.scratch.sTmp = sTmp
-
-		state.tokens = append(state.tokens, nextToken)
-
-		// Stop if we hit EOT.
-		if nextToken == d.eotToken {
-			break
-		}
+		break
 	}
 
-	// Convert token sequence to segments.
-	return d.tokensToSegments(state.tokens, params.Prompt)
+	if finalTokens == nil {
+		finalTokens = []int32{}
+	}
+
+	return d.tokensToSegments(finalTokens, params.Prompt)
 }
 
 // decodeBeamSearch uses beam search to generate tokens.
@@ -509,9 +590,14 @@ func (d *WhisperDecoder) decodeBeamSearch(ctx context.Context, encoderOut ml.Ten
 				return nil, fmt.Errorf("model: decode: beam search forward: %w", err)
 			}
 
+			// Apply repetition penalty per hypothesis to logits before selecting candidates.
+			curLogits := make([]float32, d.nVocab)
+			copy(curLogits, logits[:d.nVocab])
+			curLogits = applyRepetitionPenalty(curLogits, hyp.tokens, 1.5)
+
 			// Get top-K candidates from this hypothesis.
 			topK := 5 // Heuristic: keep top 5 candidates per hypothesis.
-			candidates, topBuf := d.topKTokensWithScratch(logits, topK, temperature, hyp.state.scratch.topK)
+			candidates, topBuf := d.topKTokensWithScratch(curLogits, topK, temperature, hyp.state.scratch.topK)
 			hyp.state.scratch.topK = topBuf
 
 			for _, candidate := range candidates {
@@ -576,6 +662,25 @@ func (d *WhisperDecoder) decodeBeamSearch(ctx context.Context, encoderOut ml.Ten
 		}
 		if allEOT {
 			break
+		}
+
+		// Safety: if best beam shows excessive repetition, assume stuck and stop.
+		if len(beams) > 0 {
+			best := beams[0]
+			if len(best.tokens) >= 2 {
+				last := best.tokens[len(best.tokens)-1]
+				streak := 1
+				for i := len(best.tokens) - 2; i >= 0 && best.tokens[i] == last; i-- {
+					streak++
+					if streak > 20 {
+						allEOT = true
+						break
+					}
+				}
+				if allEOT {
+					break
+				}
+			}
 		}
 	}
 
@@ -996,6 +1101,53 @@ func (d *WhisperDecoder) topKTokensWithScratch(logits []float32, k int, temperat
 	return top, top
 }
 
+// applyRepetitionPenalty returns a modified copy of logits where tokens appearing
+// in recent history have their logits decreased by penalty * count.
+func applyRepetitionPenalty(logits []float32, history []int32, penalty float32, historyWindow int) []float32 {
+	if penalty <= 0 || len(history) == 0 || historyWindow <= 0 {
+		return logits
+	}
+	n := len(logits)
+	out := make([]float32, n)
+	copy(out, logits)
+
+	// Consider only last `historyWindow` tokens of history.
+	start := 0
+	if len(history) > historyWindow {
+		start = len(history) - historyWindow
+	}
+	counts := make(map[int]int)
+	for i := start; i < len(history); i++ {
+		id := int(history[i])
+		if id >= 0 && id < n {
+			counts[id]++
+		}
+	}
+	for id, cnt := range counts {
+		if cnt <= 0 || id < 0 || id >= n {
+			continue
+		}
+		out[id] -= penalty * float32(cnt)
+	}
+	return out
+}
+
+// compressionRatio returns original_length / compressed_length using gzip.
+func compressionRatio(s string) float32 {
+	if s == "" {
+		return 0
+	}
+	var buf bytes.Buffer
+	gw := gzip.NewWriter(&buf)
+	_, _ = io.Copy(gw, strings.NewReader(s))
+	_ = gw.Close()
+	comp := buf.Len()
+	if comp == 0 {
+		return float32(len(s))
+	}
+	return float32(len(s)) / float32(comp)
+}
+
 // topKTokens returns the top-K tokens by probability.
 func (d *WhisperDecoder) topKTokens(logits []float32, k int, temperature float32) []struct {
 	token   int32
@@ -1193,10 +1345,31 @@ func (d *WhisperDecoder) tokensToSegments(tokens []int32, prompt []int32) ([]Seg
 	// Create a single segment with all non-prompt tokens.
 	// In a full implementation, this would decode tokens to text and split by timestamps.
 	segment := Segment{
-		Tokens: make([]TokenData, len(resultTokens)),
+		Tokens: make([]TokenData, 0, len(resultTokens)),
 	}
-	for i, token := range resultTokens {
-		segment.Tokens[i] = TokenData{ID: token}
+	// Decode tokens individually and collapse consecutive identical subword tokens.
+	var lastText string
+	decodedTokens := make([]vocab.Token, 0, len(resultTokens))
+	for _, token := range resultTokens {
+		tok := TokenData{ID: token}
+		if d.vocab != nil {
+			tok.Text = d.vocab.DecodeToken(vocab.Token(token))
+		}
+		// Collapse consecutive identical subword tokens (avoid long repeated BPE runs).
+		if tok.Text != "" && tok.Text == lastText {
+			// skip appending duplicate consecutive token
+			continue
+		}
+		lastText = tok.Text
+		segment.Tokens = append(segment.Tokens, tok)
+		if d.vocab != nil {
+			decodedTokens = append(decodedTokens, vocab.Token(token))
+		}
+	}
+
+	if d.vocab != nil {
+		// Rebuild segment text from filtered token sequence.
+		segment.Text = d.vocab.Decode(decodedTokens)
 	}
 
 	return []Segment{segment}, nil

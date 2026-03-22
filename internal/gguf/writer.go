@@ -31,11 +31,11 @@ func writeGGUF(_ context.Context, path string, f *WritableFile) error {
 		headerSize += ggufValueSize(f.meta[i].vtype, f.meta[i].val)
 	}
 	for _, t := range f.tensors {
-		headerSize += ggufStringSize(t.name) // name
-		headerSize += 4                      // n_dimensions uint32
+		headerSize += ggufStringSize(t.name)  // name
+		headerSize += 4                       // n_dimensions uint32
 		headerSize += int64(len(t.shape)) * 8 // dimensions uint64 each
-		headerSize += 4                      // type uint32
-		headerSize += 8                      // offset uint64
+		headerSize += 4                       // type uint32
+		headerSize += 8                       // offset uint64
 	}
 
 	// Pad header to 32-byte alignment.

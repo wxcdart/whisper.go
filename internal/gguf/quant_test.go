@@ -18,10 +18,10 @@ func TestQuantRoundTrip(t *testing.T) {
 	}
 
 	cases := []struct {
-		name    string
-		encode  func([]float32) []byte
-		decode  func([]byte) []float32
-		maxErr  float32
+		name   string
+		encode func([]float32) []byte
+		decode func([]byte) []float32
+		maxErr float32
 	}{
 		{
 			name:   "Q4_0",

@@ -161,6 +161,7 @@ func New(ctx context.Context, modelPath string, params ...Params) (*Context, err
 		f.Close()
 		return nil, fmt.Errorf("load vocab: %w", err)
 	}
+	dec.SetVocabulary(v)
 
 	// Create pipeline
 	pipeline, err := model.New(enc, dec, v, nil, nil)
@@ -406,9 +407,19 @@ func loadVocabFromTokenizerFile(modelPath string, expectedVocab int) (*vocab.Voc
 
 func findTokenizerFile(modelPath string) (string, error) {
 	dir := filepath.Dir(modelPath)
-	primary := filepath.Join(dir, "tokenizer.json")
-	if st, err := os.Stat(primary); err == nil && !st.IsDir() {
-		return primary, nil
+	modelBase := strings.ToLower(filepath.Base(modelPath))
+
+	preferred := []string{}
+	if strings.Contains(modelBase, "tiny") {
+		preferred = append(preferred, "tokenizer-tiny.json")
+	}
+	preferred = append(preferred, "tokenizer.json")
+
+	for _, name := range preferred {
+		p := filepath.Join(dir, name)
+		if st, err := os.Stat(p); err == nil && !st.IsDir() {
+			return p, nil
+		}
 	}
 
 	ents, err := os.ReadDir(dir)

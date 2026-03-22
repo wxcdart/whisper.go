@@ -17,7 +17,7 @@ type WhisperStreamer struct {
 
 	audioIn chan []float32
 	results chan Segment
-	
+
 	mu          sync.Mutex
 	audioBuffer []float32
 	err         error
@@ -86,7 +86,7 @@ func (s *WhisperStreamer) run() {
 		case samples := <-s.audioIn:
 			s.mu.Lock()
 			s.audioBuffer = append(s.audioBuffer, samples...)
-			
+
 			// Only process if we have enough audio
 			if len(s.audioBuffer) < minProcessSamples {
 				s.mu.Unlock()
@@ -129,7 +129,7 @@ func (s *WhisperStreamer) run() {
 			for _, seg := range res.Segments {
 				seg.StartMs += offsetMs
 				seg.EndMs += offsetMs
-				
+
 				if s.params.Logger != nil {
 					s.params.Logger.Info("streamer result", "text", seg.Text, "start", seg.StartMs, "end", seg.EndMs)
 				}
