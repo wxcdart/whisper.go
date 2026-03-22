@@ -91,6 +91,30 @@ func mapTensorName(name string) string {
 		if !ok {
 			return ""
 		}
+
+		// Legacy ggml .bin uses decoder.blocks.<i>.attn_* for decoder self-attention.
+		legacyBase := "decoder.blocks." + strconv.Itoa(i) + "."
+		switch suffix {
+		case "self_attn_ln.weight":
+			return legacyBase + "attn_ln.weight"
+		case "self_attn_ln.bias":
+			return legacyBase + "attn_ln.bias"
+		case "self_attn.query.weight":
+			return legacyBase + "attn.query.weight"
+		case "self_attn.query.bias":
+			return legacyBase + "attn.query.bias"
+		case "self_attn.key.weight":
+			return legacyBase + "attn.key.weight"
+		case "self_attn.value.weight":
+			return legacyBase + "attn.value.weight"
+		case "self_attn.value.bias":
+			return legacyBase + "attn.value.bias"
+		case "self_attn.out.weight":
+			return legacyBase + "attn.out.weight"
+		case "self_attn.out.bias":
+			return legacyBase + "attn.out.bias"
+		}
+
 		base := "model.decoder.layers." + strconv.Itoa(i) + "."
 		switch suffix {
 		case "self_attn_ln.weight":

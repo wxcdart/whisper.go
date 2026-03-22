@@ -79,256 +79,158 @@ func parseBin(f *os.File) (*binFile, error) {
 	if _, err := f.Seek(0, io.SeekStart); err != nil {
 		return nil, fmt.Errorf("seek start: %w", err)
 	}
-	var mag [4]byte
-	if _, err := io.ReadFull(f, mag[:]); err != nil {
+
+	var magic uint32
+	if err := binary.Read(f, binary.LittleEndian, &magic); err != nil {
 		return nil, fmt.Errorf("read magic: %w", err)
 	}
-	if string(mag[:]) != "lmgg" && string(mag[:]) != "GGML" {
-		return nil, fmt.Errorf("legacy bin: invalid magic %q", string(mag[:]))
+	if magic != 0x67676d6c { // "ggml"
+		return nil, fmt.Errorf("legacy bin: invalid magic 0x%x", magic)
 	}
 
-	// Read up to 8 header uint32 fields (some files have fewer). Tolerate
-	// short reads — we'll keep the first few values as metadata.
-	var header [8]uint32
-	for i := 0; i < 8; i++ {
-		if err := binary.Read(f, binary.LittleEndian, &header[i]); err != nil {
-			break
+	// Legacy convert-pt-to-ggml header layout after magic:
+	// n_vocab, n_audio_ctx, n_audio_state, n_audio_head, n_audio_layer,
+	// n_text_ctx, n_text_state, n_text_head, n_text_layer, n_mels, use_f16
+	var h [11]uint32
+	for i := range h {
+		if err := binary.Read(f, binary.LittleEndian, &h[i]); err != nil {
+			return nil, fmt.Errorf("legacy bin: read hparams[%d]: %w", i, err)
 		}
 	}
-	meta := make(map[string]any)
-	for i := 0; i < 4; i++ {
-		meta[fmt.Sprintf("ggml.header.%d", i)] = header[i]
+
+	meta := map[string]any{
+		"ggml.magic":                           magic,
+		"whisper.vocab.size":                   h[0],
+		"whisper.encoder.context_length":       h[1],
+		"whisper.encoder.embedding_length":     h[2],
+		"whisper.encoder.attention.head_count": h[3],
+		"whisper.encoder.layer_count":          h[4],
+		"whisper.decoder.context_length":       h[5],
+		"whisper.decoder.embedding_length":     h[6],
+		"whisper.decoder.attention.head_count": h[7],
+		"whisper.decoder.layer_count":          h[8],
+		"whisper.audio.mel_count":              h[9],
+		"ggml.use_f16":                         h[10],
 	}
 
-	// Heuristically parse tensor descriptors: the legacy format stores
-	// null-terminated names followed by ndim (uint32), dims (uint32[]),
-	// dtype (uint32) and offset (uint64). We'll read entries until a
-	// sanity check fails.
+	// Mel filters block: [rows:int32][cols:int32][rows*cols float32]
+	var melRows, melCols uint32
+	if err := binary.Read(f, binary.LittleEndian, &melRows); err != nil {
+		return nil, fmt.Errorf("legacy bin: read mel rows: %w", err)
+	}
+	if err := binary.Read(f, binary.LittleEndian, &melCols); err != nil {
+		return nil, fmt.Errorf("legacy bin: read mel cols: %w", err)
+	}
+	meta["ggml.mel.rows"] = melRows
+	meta["ggml.mel.cols"] = melCols
+
+	melElems := uint64(melRows) * uint64(melCols)
+	melBytes := int64(melElems * 4)
+	if melBytes > 0 {
+		if _, err := f.Seek(melBytes, io.SeekCurrent); err != nil {
+			return nil, fmt.Errorf("legacy bin: skip mel data: %w", err)
+		}
+	}
+
+	// Tokenizer block: [num_tokens:int32][len:int32][bytes]...
+	var numTokens uint32
+	if err := binary.Read(f, binary.LittleEndian, &numTokens); err != nil {
+		return nil, fmt.Errorf("legacy bin: read tokenizer count: %w", err)
+	}
+	meta["ggml.token.count"] = numTokens
+
+	for i := uint32(0); i < numTokens; i++ {
+		var tokenLen uint32
+		if err := binary.Read(f, binary.LittleEndian, &tokenLen); err != nil {
+			return nil, fmt.Errorf("legacy bin: read tokenizer len[%d]: %w", i, err)
+		}
+		if tokenLen > 0 {
+			if _, err := f.Seek(int64(tokenLen), io.SeekCurrent); err != nil {
+				return nil, fmt.Errorf("legacy bin: skip tokenizer bytes[%d]: %w", i, err)
+			}
+		}
+	}
+
 	tdmap := make(map[string]struct {
 		shape  []uint64
 		dtype  uint32
 		offset uint64
 	})
-	var names []string
+	names := make([]string, 0, 512)
 
 	for {
-		// read name using tolerant strategies (NUL-terminated or length-prefixed)
-		namePos, _ := f.Seek(0, io.SeekCurrent)
-		name, err := readNullString(f, 512)
-		if err != nil || name == "" || !looksLikeName(name) {
-			// try length-prefixed name (uint32 length + bytes)
-			if _, err := f.Seek(namePos, io.SeekStart); err != nil {
+		var nDims, nameLen, ftype uint32
+		if err := binary.Read(f, binary.LittleEndian, &nDims); err != nil {
+			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 				break
 			}
-			var l uint32
-			if err := binary.Read(f, binary.LittleEndian, &l); err != nil {
-				break
+			return nil, fmt.Errorf("legacy bin: read tensor n_dims: %w", err)
+		}
+		if err := binary.Read(f, binary.LittleEndian, &nameLen); err != nil {
+			return nil, fmt.Errorf("legacy bin: read tensor name_len: %w", err)
+		}
+		if err := binary.Read(f, binary.LittleEndian, &ftype); err != nil {
+			return nil, fmt.Errorf("legacy bin: read tensor ftype: %w", err)
+		}
+
+		if nDims == 0 || nDims > 8 || nameLen == 0 || nameLen > 4096 {
+			return nil, fmt.Errorf("legacy bin: invalid tensor header n_dims=%d name_len=%d ftype=%d", nDims, nameLen, ftype)
+		}
+
+		dimsGGML := make([]uint32, nDims)
+		for i := uint32(0); i < nDims; i++ {
+			if err := binary.Read(f, binary.LittleEndian, &dimsGGML[i]); err != nil {
+				return nil, fmt.Errorf("legacy bin: read tensor dim[%d]: %w", i, err)
 			}
-			if l == 0 || l > 4096 {
-				break
-			}
-			nb := make([]byte, l)
-			if _, err := io.ReadFull(f, nb); err != nil {
-				break
-			}
-			name = string(nb)
-			// trim any trailing NUL
-			if idx := strings.IndexByte(name, 0); idx >= 0 {
-				name = name[:idx]
-			}
-			if name == "" || !looksLikeName(name) {
-				break
+			if dimsGGML[i] == 0 {
+				return nil, fmt.Errorf("legacy bin: invalid zero tensor dim[%d]", i)
 			}
 		}
 
-		var ndim uint32
-		if err := binary.Read(f, binary.LittleEndian, &ndim); err != nil {
-			break
-		}
-		if ndim == 0 || ndim > 8 {
-			break
-		}
-		shape := make([]uint64, ndim)
-		ok := true
-		for i := uint32(0); i < ndim; i++ {
-			var d uint32
-			if err := binary.Read(f, binary.LittleEndian, &d); err != nil {
-				ok = false
-				break
-			}
-			if d == 0 || d > 1_000_000 {
-				ok = false
-				break
-			}
-			shape[i] = uint64(d)
-		}
-		if !ok {
-			break
-		}
-		var dtype uint32
-		if err := binary.Read(f, binary.LittleEndian, &dtype); err != nil {
-			break
-		}
-		// accept known dtype codes
-		known := dtype == 0 || dtype == 1 || dtype == 2 || dtype == 3 || dtype == 6 || dtype == 7 || dtype == 8 || dtype == 12
-		if !known {
-			break
-		}
-		// offset may be stored as uint64 or uint32 in some legacy dumps.
-		var offset uint64
-		if err := binary.Read(f, binary.LittleEndian, &offset); err != nil {
-			// try uint32 fallback
-			if _, err2 := f.Seek(-8, io.SeekCurrent); err2 == nil {
-				var off32 uint32
-				if err3 := binary.Read(f, binary.LittleEndian, &off32); err3 == nil {
-					offset = uint64(off32)
-				} else {
-					break
-				}
-			} else {
-				break
-			}
-		}
-		// If offset looks relative (small and within file), accept it; if it's larger
-		// than file size assume it's relative to data start and keep as-is for now.
-		fi, _ := f.Stat()
-		if offset == 0 {
-			break
-		}
-		if int64(offset) > fi.Size() {
-			// allow relative offsets; store as-is
+		nameBytes := make([]byte, nameLen)
+		if _, err := io.ReadFull(f, nameBytes); err != nil {
+			return nil, fmt.Errorf("legacy bin: read tensor name: %w", err)
 		}
 
-		names = append(names, name)
-		tdmap[name] = struct {
-			shape  []uint64
-			dtype  uint32
-			offset uint64
-		}{shape: shape, dtype: dtype, offset: offset}
-	}
+		name := cleanTensorName(string(nameBytes))
+		if name == "" {
+			return nil, fmt.Errorf("legacy bin: empty tensor name after cleanup")
+		}
 
-	// If heuristics failed to find any tensor descriptors, perform a
-	// tolerant scan of the file for printable name-like strings and try
-	// to parse descriptors located after them. This handles many legacy
-	// `.bin` variants that don't store strictly NUL-terminated names.
-	if len(names) == 0 {
-		// Read entire file into memory for scanning (models are typically
-		// tens of MB — acceptable for a one-time parse operation).
-		fi, err := f.Stat()
-		if err == nil {
-			size := fi.Size()
-			if size > 0 && size < 1<<30 { // guard against absurd sizes
-				buf := make([]byte, size)
-				if _, err := f.Seek(0, io.SeekStart); err == nil {
-					if _, err := io.ReadFull(f, buf); err == nil {
-						// Find candidate names: 6+ printable chars (letters/digits/._)
-						re := regexp.MustCompile("[A-Za-z0-9_.]{6,200}")
-						matches := re.FindAllIndex(buf, -1)
-						seen := make(map[string]struct{})
-						for _, m := range matches {
-							start := m[0]
-							end := m[1]
-							name := string(buf[start:end])
-							// quick filter: require common prefixes used in models
-							if !strings.Contains(name, "encoder") && !strings.Contains(name, "decoder") && !strings.Contains(name, "positional") && !strings.Contains(name, "ln_") && !strings.Contains(name, "conv") {
-								continue
-							}
-							if _, ok := seen[name]; ok {
-								continue
-							}
-							// attempt to parse descriptor just after the matched name
-							// try a few offsets in case of a separator byte
-							var parsed bool
-							for offShift := 0; offShift < 8 && !parsed; offShift++ {
-								p := end + offShift
-								// need at least 4 bytes for ndim
-								if p+4 > len(buf) {
-									break
-								}
-								ndim := binary.LittleEndian.Uint32(buf[p : p+4])
-								if ndim == 0 || ndim > 8 {
-									continue
-								}
-								// ensure enough bytes for dims
-								req := int(p+4) + int(ndim)*4 + 4 + 8
-								if req > len(buf) {
-									continue
-								}
-								shape := make([]uint64, ndim)
-								okShape := true
-								q := p + 4
-								for i := uint32(0); i < ndim; i++ {
-									d := binary.LittleEndian.Uint32(buf[q : q+4])
-									if d == 0 || d > 1_000_000 {
-										okShape = false
-										break
-									}
-									shape[i] = uint64(d)
-									q += 4
-								}
-								if !okShape {
-									continue
-								}
-								dtype := binary.LittleEndian.Uint32(buf[q : q+4])
-								q += 4
-								// offset may be uint64 or uint32; try uint64 first
-								offset := binary.LittleEndian.Uint64(buf[q : q+8])
-								// basic dtype check
-								known := dtype == 0 || dtype == 1 || dtype == 2 || dtype == 3 || dtype == 6 || dtype == 7 || dtype == 8 || dtype == 12
-								if !known || offset == 0 {
-									// try uint32 fallback
-									off32 := binary.LittleEndian.Uint32(buf[q-8 : q-4])
-									if off32 == 0 {
-										continue
-									}
-									offset = uint64(off32)
-								}
-								// offset sanity: must be within file
-								if int64(offset) <= 0 || int64(offset) > fi.Size() {
-									continue
-								}
-								// accept
-								names = append(names, name)
-								tdmap[name] = struct {
-									shape  []uint64
-									dtype  uint32
-									offset uint64
-								}{shape: shape, dtype: dtype, offset: offset}
-								seen[name] = struct{}{}
-								parsed = true
-							}
-						}
-					}
-				}
+		shape := make([]uint64, nDims)
+		nElems := uint64(1)
+		// Convert from ggml storage order to conventional tensor order.
+		for i := uint32(0); i < nDims; i++ {
+			d := uint64(dimsGGML[nDims-1-i])
+			shape[i] = d
+			nElems *= d
+		}
+
+		dataOffset, err := f.Seek(0, io.SeekCurrent)
+		if err != nil {
+			return nil, fmt.Errorf("legacy bin: get tensor data offset: %w", err)
+		}
+
+		rawBytes, err := rawSizeLocal(ftype, nElems)
+		if err != nil {
+			return nil, fmt.Errorf("legacy bin: tensor %q raw size: %w", name, err)
+		}
+		if _, err := f.Seek(int64(rawBytes), io.SeekCurrent); err != nil {
+			return nil, fmt.Errorf("legacy bin: skip tensor %q data: %w", name, err)
+		}
+
+		if _, exists := tdmap[name]; !exists {
+			names = append(names, name)
+			tdmap[name] = struct {
+				shape  []uint64
+				dtype  uint32
+				offset uint64
+			}{
+				shape:  shape,
+				dtype:  ftype,
+				offset: uint64(dataOffset),
 			}
 		}
-	}
-
-	// Normalize discovered names by cleaning common mangling (trailing
-	// punctuation, non-printable chars) so consumers can look up tensors
-	// by the canonical names used elsewhere in the codebase.
-	if len(names) > 0 {
-		newNames := make([]string, 0, len(names))
-		newTdmap := make(map[string]struct {
-			shape  []uint64
-			dtype  uint32
-			offset uint64
-		})
-		for _, orig := range names {
-			td := tdmap[orig]
-			cleaned := cleanTensorName(orig)
-			if cleaned == "" {
-				// keep original if cleaning produced nothing
-				cleaned = orig
-			}
-			if _, ok := newTdmap[cleaned]; ok {
-				continue
-			}
-			newNames = append(newNames, cleaned)
-			newTdmap[cleaned] = td
-		}
-		names = newNames
-		tdmap = newTdmap
 	}
 
 	return &binFile{f: f, meta: meta, names: names, tdmap: tdmap}, nil

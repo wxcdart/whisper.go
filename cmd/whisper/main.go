@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 	"unsafe"
@@ -91,6 +92,8 @@ func run(ctx context.Context) error {
 	var (
 		modelType          string
 		dtwTokenTimestamps bool
+		timedBackend       bool
+		timedBackendTop    int
 		verbose            int
 	)
 
@@ -167,11 +170,22 @@ func run(ctx context.Context) error {
 	fs.StringVar(&modelType, "model-type", "", "hint for model type (for debug)")
 	fs.BoolVar(&dtwTokenTimestamps, "dtw-token-timestamps", false, "enable DTW alignment")
 	fs.BoolVar(&dtwTokenTimestamps, "dtw", false, "enable DTW alignment [short form]")
+	fs.BoolVar(&timedBackend, "timed-backend", false, "enable timed model backend instrumentation")
+	fs.IntVar(&timedBackendTop, "timed-backend-top", 10, "number of timed backend ops to print (0 = all)")
 	fs.IntVar(&verbose, "verbose", 1, "verbosity level (0=quiet, 1=normal, 2=debug)")
 	fs.IntVar(&verbose, "v", 1, "verbosity level [short form]")
 
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		return err
+	}
+
+	if !timedBackend {
+		if v := strings.TrimSpace(os.Getenv("WHISPERGO_TIMED_BACKEND")); v != "" {
+			enabled, err := strconv.ParseBool(v)
+			if err == nil {
+				timedBackend = enabled
+			}
+		}
 	}
 
 	// Validate input file
@@ -263,7 +277,14 @@ func run(ctx context.Context) error {
 		params.DTWPreset = "default"
 	}
 
-	transcriber, err := whisper.New(ctx, modelPath, params)
+	var backend model.ComputeBackend
+	var timed *model.TimedBackend
+	if timedBackend {
+		timed = model.NewTimedBackend(nil)
+		backend = timed
+	}
+
+	transcriber, err := whisper.NewWithModelBackend(ctx, modelPath, backend, params)
 	if err != nil {
 		return fmt.Errorf("failed to load model: %w", err)
 	}
@@ -310,6 +331,19 @@ func run(ctx context.Context) error {
 
 	if verbose > 0 {
 		fmt.Fprintf(os.Stderr, "Transcription complete in %d ms\n", transcribeMs)
+	}
+
+	if timed != nil {
+		entries := timed.SortedByTotal()
+		limit := len(entries)
+		if timedBackendTop > 0 && timedBackendTop < limit {
+			limit = timedBackendTop
+		}
+		fmt.Fprintf(os.Stderr, "Timed backend stats (top %d by total):\n", limit)
+		for i := 0; i < limit; i++ {
+			e := entries[i]
+			fmt.Fprintf(os.Stderr, "  %2d. %-30s calls=%d total=%s avg=%s\n", i+1, e.Op, e.Calls, e.Total, e.Avg())
+		}
 	}
 
 	return nil

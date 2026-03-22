@@ -10,6 +10,21 @@ import (
 
 const layerNormEps = float32(1e-5)
 
+func flattenVectorTensor(t ml.Tensor) ml.Tensor {
+	if len(t.Shape) == 1 {
+		return t
+	}
+	if len(t.Shape) == 2 {
+		if t.Shape[1] == 1 {
+			return ml.From(t.Data, t.Shape[0])
+		}
+		if t.Shape[0] == 1 {
+			return ml.From(t.Data, t.Shape[1])
+		}
+	}
+	return t
+}
+
 // selfAttn holds Q/K/V/out weight and bias tensors for one self-attention layer.
 type selfAttn struct {
 	qW, qB     ml.Tensor // [nAudioState, nAudioState], [nAudioState]
@@ -173,6 +188,7 @@ func NewEncoderWithBackend(f gguf.FileLike, backend ComputeBackend) (*WhisperEnc
 	if e.conv1B, _, err = loadTensorAuto(ctx, f, "encoder.conv1.bias"); err != nil {
 		return nil, err
 	}
+	e.conv1B = flattenVectorTensor(e.conv1B)
 
 	t, _, err = loadTensorAuto(ctx, f, "encoder.conv2.weight")
 	if err != nil {
@@ -193,6 +209,7 @@ func NewEncoderWithBackend(f gguf.FileLike, backend ComputeBackend) (*WhisperEnc
 	if e.conv2B, _, err = loadTensorAuto(ctx, f, "encoder.conv2.bias"); err != nil {
 		return nil, err
 	}
+	e.conv2B = flattenVectorTensor(e.conv2B)
 
 	if e.posEmb, _, err = loadTensorAuto(ctx, f, "encoder.positional_embedding"); err != nil {
 		return nil, err

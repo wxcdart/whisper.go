@@ -2,6 +2,7 @@ package model
 
 import (
 	"context"
+	"sort"
 	"sync"
 	"time"
 
@@ -12,6 +13,20 @@ import (
 type OpTimingStats struct {
 	Calls int64
 	Total time.Duration
+}
+
+// Avg returns the average duration per call. Zero if there were no calls.
+func (s OpTimingStats) Avg() time.Duration {
+	if s.Calls <= 0 {
+		return 0
+	}
+	return time.Duration(int64(s.Total) / s.Calls)
+}
+
+// OpTimingEntry is a named timing record used for sorted reporting.
+type OpTimingEntry struct {
+	Op string
+	OpTimingStats
 }
 
 // TimedBackend wraps a ComputeBackend and records per-operation call counts and latency totals.
@@ -43,6 +58,22 @@ func (t *TimedBackend) Snapshot() map[string]OpTimingStats {
 		out[k] = v
 	}
 	return out
+}
+
+// SortedByTotal returns timing entries sorted by total time (descending), then op name.
+func (t *TimedBackend) SortedByTotal() []OpTimingEntry {
+	stats := t.Snapshot()
+	entries := make([]OpTimingEntry, 0, len(stats))
+	for op, s := range stats {
+		entries = append(entries, OpTimingEntry{Op: op, OpTimingStats: s})
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].Total == entries[j].Total {
+			return entries[i].Op < entries[j].Op
+		}
+		return entries[i].Total > entries[j].Total
+	})
+	return entries
 }
 
 // Reset clears all recorded timing stats.
