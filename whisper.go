@@ -136,6 +136,12 @@ type TokenData struct {
 
 // New loads a model from the given GGUF file path.
 func New(ctx context.Context, modelPath string, params ...Params) (*Context, error) {
+	return NewWithModelBackend(ctx, modelPath, nil, params...)
+}
+
+// NewWithModelBackend loads a model from the given GGUF file path and configures encoder/decoder
+// to use the provided model compute backend. If backend is nil, the default ml backend is used.
+func NewWithModelBackend(ctx context.Context, modelPath string, backend model.ComputeBackend, params ...Params) (*Context, error) {
 	// Load GGUF or legacy ggml file
 	f, err := ggml.Open(ctx, modelPath)
 	if err != nil {
@@ -143,14 +149,14 @@ func New(ctx context.Context, modelPath string, params ...Params) (*Context, err
 	}
 
 	// Load encoder
-	enc, err := model.NewEncoder(f)
+	enc, err := model.NewEncoderWithBackend(f, backend)
 	if err != nil {
 		f.Close()
 		return nil, fmt.Errorf("load encoder: %w", err)
 	}
 
 	// Load decoder
-	dec, err := model.NewDecoder(f)
+	dec, err := model.NewDecoderWithBackend(f, backend)
 	if err != nil {
 		f.Close()
 		return nil, fmt.Errorf("load decoder: %w", err)

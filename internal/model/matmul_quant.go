@@ -6,20 +6,20 @@ import (
 	"github.com/whispergo/whisper.go/internal/ml"
 )
 
-func matMulTransBMaybeQuant(ctx context.Context, a, w ml.Tensor, wq *ml.QuantizedMatrix) (ml.Tensor, error) {
-	if wq != nil && (len(w.Shape) == 0 || ml.ShouldUseQuantMatMul(a.Shape[0], a.Shape[1], wq.Rows, wq.QuantType)) {
+func matMulTransBMaybeQuant(ctx context.Context, backend ComputeBackend, a, w ml.Tensor, wq *ml.QuantizedMatrix) (ml.Tensor, error) {
+	if wq != nil && (len(w.Shape) == 0 || backend.ShouldUseQuantMatMul(a.Shape[0], a.Shape[1], wq.Rows, wq.QuantType)) {
 		out := ml.New(a.Shape[0], wq.Rows)
-		if err := ml.MatMulQuantTransBInto(ctx, a, *wq, out); err != nil {
+		if err := backend.MatMulQuantTransBInto(ctx, a, *wq, out); err != nil {
 			return ml.Tensor{}, err
 		}
 		return out, nil
 	}
-	return ml.MatMulTransB(ctx, a, w)
+	return backend.MatMulTransB(ctx, a, w)
 }
 
-func matMulTransBMaybeQuantInto(ctx context.Context, a, w ml.Tensor, wq *ml.QuantizedMatrix, out ml.Tensor) error {
-	if wq != nil && (len(w.Shape) == 0 || ml.ShouldUseQuantMatMul(a.Shape[0], a.Shape[1], wq.Rows, wq.QuantType)) {
-		return ml.MatMulQuantTransBInto(ctx, a, *wq, out)
+func matMulTransBMaybeQuantInto(ctx context.Context, backend ComputeBackend, a, w ml.Tensor, wq *ml.QuantizedMatrix, out ml.Tensor) error {
+	if wq != nil && (len(w.Shape) == 0 || backend.ShouldUseQuantMatMul(a.Shape[0], a.Shape[1], wq.Rows, wq.QuantType)) {
+		return backend.MatMulQuantTransBInto(ctx, a, *wq, out)
 	}
-	return ml.MatMulTransBInto(ctx, a, w, out)
+	return backend.MatMulTransBInto(ctx, a, w, out)
 }
