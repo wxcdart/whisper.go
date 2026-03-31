@@ -41,6 +41,7 @@ type Params struct {
 	Processors         int
 	BeamSize           int
 	BestOf             int
+	MaxTokens          int
 	Temperature        float32
 	TemperatureInc     float32
 	EntropyThold       float32
@@ -94,6 +95,7 @@ func DefaultParams() Params {
 		Threads:           4,
 		BeamSize:          5,
 		BestOf:            5,
+		MaxTokens:         128,
 		Temperature:       0.0,
 		TemperatureInc:    0.2,
 		EntropyThold:      2.40,
@@ -249,7 +251,7 @@ func (c *Context) Transcribe(ctx context.Context, samples []float32, params Para
 			LogprobThold:   params.LogprobThold,
 			NoSpeechThold:  params.NoSpeechThold,
 			NoFallback:     params.NoFallback,
-			MaxTokens:      params.MaxLen,
+			MaxTokens:      params.MaxTokens,
 			SuppressNST:    params.SuppressNST,
 			SuppressRegex:  params.SuppressRegex,
 			DTWEnabled:     params.DTWPreset != "",

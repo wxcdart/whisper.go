@@ -136,8 +136,8 @@ func run(ctx context.Context) error {
 	fs.IntVar(&noContext, "nc", 0, "disable context [short form]")
 	fs.IntVar(&audioCtx, "audio-ctx", 0, "audio context (set to 0 for full audio)")
 	fs.IntVar(&maxTokens, "max-tokens", 128, "max tokens per inference")
-	fs.BoolVar(&suppressNST, "suppress-non-text-tokens", false, "suppress special tokens in output")
-	fs.BoolVar(&suppressNST, "ss", false, "suppress special tokens in output [short form]")
+	fs.BoolVar(&suppressNST, "suppress-non-text-tokens", true, "suppress special tokens in output")
+	fs.BoolVar(&suppressNST, "ss", true, "suppress special tokens in output [short form]")
 	fs.StringVar(&suppressRegex, "suppress-regex", "", "regex patterns to suppress in output")
 	fs.StringVar(&suppressRegex, "sr", "", "regex patterns to suppress in output [short form]")
 	fs.BoolVar(&printColors, "print-colors", false, "print with ANSI colors")
@@ -241,6 +241,7 @@ func run(ctx context.Context) error {
 		Language:           language,
 		Task:               task,
 		Threads:            threads,
+		MaxTokens:          maxTokens,
 		BeamSize:           beamSize,
 		BestOf:             bestOf,
 		Temperature:        float32(temperature),

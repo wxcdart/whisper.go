@@ -185,18 +185,21 @@ func NewDecoderWithBackend(f gguf.FileLike, backend ComputeBackend) (*WhisperDec
 	}
 
 	// Load token embedding [nVocab, nTextState].
-	if q, _, qErr := loadQuantizedMatrixAuto(ctx, f, "decoder.token_embedding.weight"); qErr == nil && q != nil && q.Rows == d.nVocab && q.Cols == d.nTextState {
-		d.tokenEmbQ = q
-	} else {
-		if d.tokenEmb, _, err = loadTensorAuto(ctx, f, "decoder.token_embedding.weight"); err != nil {
-			return nil, err
+	// Keep optional quantized matrix for final logits projection, but always load
+	// dense embedding for per-token lookup during autoregressive decoding.
+	if q, _, qErr := loadQuantizedMatrixAuto(ctx, f, "decoder.token_embedding.weight"); qErr == nil && q != nil {
+		if q.Rows == d.nVocab && q.Cols == d.nTextState {
+			d.tokenEmbQ = q
 		}
-		if len(d.tokenEmb.Shape) != 2 {
-			return nil, fmt.Errorf("model: decoder: invalid token embedding shape %v", d.tokenEmb.Shape)
-		}
-		if d.tokenEmb.Shape[0] == d.nTextState && d.tokenEmb.Shape[1] == d.nVocab {
-			d.tokenEmb = ml.Transpose(d.tokenEmb, 1, 0)
-		}
+	}
+	if d.tokenEmb, _, err = loadTensorAuto(ctx, f, "decoder.token_embedding.weight"); err != nil {
+		return nil, err
+	}
+	if len(d.tokenEmb.Shape) != 2 {
+		return nil, fmt.Errorf("model: decoder: invalid token embedding shape %v", d.tokenEmb.Shape)
+	}
+	if d.tokenEmb.Shape[0] == d.nTextState && d.tokenEmb.Shape[1] == d.nVocab {
+		d.tokenEmb = ml.Transpose(d.tokenEmb, 1, 0)
 	}
 
 	// Load positional embedding [nTextCtx, nTextState].
@@ -1017,6 +1020,10 @@ func (d *WhisperDecoder) sampleGreedyWithScratch(logits []float32, temperature f
 		return 0, idxScratch, scaledScratch, fmt.Errorf("model: decode: sample: logits length mismatch")
 	}
 
+	if params.SuppressNST {
+		d.suppressNonTextLogits(logits)
+	}
+
 	invTemp := float32(1.0)
 	if temperature > 0 {
 		invTemp = 1 / temperature
@@ -1029,26 +1036,6 @@ func (d *WhisperDecoder) sampleGreedyWithScratch(logits []float32, temperature f
 		if s > maxScaled {
 			maxScaled = s
 			maxIdx = i
-		}
-	}
-
-	if params.SuppressNST && d.eotToken >= 0 && int(d.eotToken) < len(logits) {
-		if logits[d.eotToken] < -params.NoSpeechThold && maxIdx == int(d.eotToken) {
-			maxIdx = -1
-			maxScaled = float32(math.Inf(-1))
-			for i := 0; i < len(logits); i++ {
-				if i == int(d.eotToken) {
-					continue
-				}
-				s := logits[i] * invTemp
-				if s > maxScaled {
-					maxScaled = s
-					maxIdx = i
-				}
-			}
-			if maxIdx < 0 {
-				maxIdx = int(d.eotToken)
-			}
 		}
 	}
 
@@ -1075,6 +1062,37 @@ func (d *WhisperDecoder) sampleGreedyWithScratch(logits []float32, temperature f
 	}
 
 	return int32(maxIdx), idxScratch, scaledScratch, nil
+}
+
+func (d *WhisperDecoder) suppressNonTextLogits(logits []float32) {
+	if d.vocab == nil {
+		return
+	}
+	setInfNeg := func(id int32) {
+		if id >= 0 && int(id) < len(logits) {
+			logits[id] = float32(math.Inf(-1))
+		}
+	}
+
+	s := d.vocab.Special()
+	// Keep EOT available; suppress other control/meta tokens.
+	setInfNeg(int32(s.SOT))
+	setInfNeg(int32(s.NoSpeech))
+	setInfNeg(int32(s.Translate))
+	setInfNeg(int32(s.Transcribe))
+	setInfNeg(int32(s.Prev))
+	setInfNeg(int32(s.SOLM))
+	setInfNeg(int32(s.NotSOT))
+
+	for _, langID := range s.Languages {
+		setInfNeg(int32(langID))
+	}
+
+	if s.TimestampBegin >= 0 && s.TimestampEnd >= s.TimestampBegin {
+		for tok := s.TimestampBegin; tok <= s.TimestampEnd; tok++ {
+			setInfNeg(int32(tok))
+		}
+	}
 }
 
 // sampleGreedy samples the next token using greedy sampling with temperature and fallback.
