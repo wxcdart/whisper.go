@@ -1,39 +1,8 @@
 package ml
 
-import "fmt"
-
-// MatMul computes C = A * B using a simple triple-loop algorithm.
-// A: m x n, B: n x p -> C: m x p
-func MatMul(a, b *Tensor) (*Tensor, error) {
-    if a.Cols() != b.Rows() {
-        return nil, fmt.Errorf("matmul: incompatible dims %dx%d * %dx%d", a.Rows(), a.Cols(), b.Rows(), b.Cols())
-    }
-    m := a.Rows()
-    n := a.Cols()
-    p := b.Cols()
-    c := NewTensor(m, p)
-
-    // iterate i,k,j order for cache locality on simple layouts
-    for i := 0; i < m; i++ {
-        for k := 0; k < n; k++ {
-            aik := a.At(i, k)
-            baseC := i*p
-            for j := 0; j < p; j++ {
-                c.Data[baseC+j] += aik * b.At(k, j)
-            }
-        }
-    }
-
-    return c, nil
-}
-package ml
-
 import (
 	"context"
 	"fmt"
-
-	"gonum.org/v1/gonum/blas"
-	"gonum.org/v1/gonum/blas/blas32"
 )
 
 // MatMul computes C = A @ B.
@@ -95,36 +64,36 @@ func matmul2DInto(ctx context.Context, a, b Tensor, transB bool, out Tensor) err
 	}
 	M, K := a.Shape[0], a.Shape[1]
 	var N int
-	tB := blas.NoTrans
-	var bGeneral blas32.General
+	tB := cblasTranspose(transB)
+	var ldb int32
 	if transB {
-		// b is [N, K], we want to treat it as [K, N] transposed.
-		// BLAS Gemm with blas.Trans expects the General struct to describe
-		// the NON-transposed matrix.
+		// b is [N, K], treated as [K, N] transposed.
 		N = b.Shape[0]
 		if b.Shape[1] != K {
 			return fmt.Errorf("%w: matmul2D transB: a K=%d != b cols=%d", ErrShapeMismatch, K, b.Shape[1])
 		}
-		tB = blas.Trans
-		bGeneral = blas32.General{Rows: N, Cols: K, Data: b.Data, Stride: K}
+		ldb = int32(K)
 	} else {
 		// b is [K, N]
 		if b.Shape[0] != K {
 			return fmt.Errorf("%w: matmul2D: a K=%d != b rows=%d", ErrShapeMismatch, K, b.Shape[0])
 		}
 		N = b.Shape[1]
-		bGeneral = blas32.General{Rows: K, Cols: N, Data: b.Data, Stride: N}
+		ldb = int32(N)
 	}
 
 	if out.Shape[0] != M || out.Shape[1] != N {
 		return fmt.Errorf("%w: matmul2DInto out shape: got %v want [%d %d]", ErrShapeMismatch, out.Shape, M, N)
 	}
 
-	blas32.Gemm(blas.NoTrans, tB, 1,
-		blas32.General{Rows: M, Cols: K, Data: a.Data, Stride: K},
-		bGeneral,
+	sgemmImpl(
+		cblasNoTrans, tB,
+		int32(M), int32(N), int32(K),
+		1,
+		a.Data, int32(K),
+		b.Data, ldb,
 		0,
-		blas32.General{Rows: M, Cols: N, Data: out.Data, Stride: N},
+		out.Data, int32(N),
 	)
 
 	return nil
@@ -137,20 +106,22 @@ func matmulBatched(ctx context.Context, a, b Tensor, transB bool) (Tensor, error
 	}
 	B, M, K := a.Shape[0], a.Shape[1], a.Shape[2]
 	var N int
-	tB := blas.NoTrans
+	tB := cblasTranspose(transB)
+	var ldb int32
 	if transB {
 		// b is [B, N, K]
 		if b.Shape[2] != K {
 			return Tensor{}, fmt.Errorf("%w: matmulBatched transB: K mismatch", ErrShapeMismatch)
 		}
 		N = b.Shape[1]
-		tB = blas.Trans
+		ldb = int32(K)
 	} else {
 		// b is [B, K, N]
 		if b.Shape[1] != K {
 			return Tensor{}, fmt.Errorf("%w: matmulBatched: K mismatch", ErrShapeMismatch)
 		}
 		N = b.Shape[2]
+		ldb = int32(N)
 	}
 	c := New(B, M, N)
 
@@ -161,20 +132,23 @@ func matmulBatched(ctx context.Context, a, b Tensor, transB bool) (Tensor, error
 		aOff := bIdx * M * K
 		cOff := bIdx * M * N
 
-		var bGeneral blas32.General
+		var bSlice []float32
 		if transB {
 			bOff := bIdx * N * K
-			bGeneral = blas32.General{Rows: N, Cols: K, Data: b.Data[bOff : bOff+N*K], Stride: K}
+			bSlice = b.Data[bOff : bOff+N*K]
 		} else {
 			bOff := bIdx * K * N
-			bGeneral = blas32.General{Rows: K, Cols: N, Data: b.Data[bOff : bOff+K*N], Stride: N}
+			bSlice = b.Data[bOff : bOff+K*N]
 		}
 
-		blas32.Gemm(blas.NoTrans, tB, 1,
-			blas32.General{Rows: M, Cols: K, Data: a.Data[aOff : aOff+M*K], Stride: K},
-			bGeneral,
+		sgemmImpl(
+			cblasNoTrans, tB,
+			int32(M), int32(N), int32(K),
+			1,
+			a.Data[aOff:aOff+M*K], int32(K),
+			bSlice, ldb,
 			0,
-			blas32.General{Rows: M, Cols: N, Data: c.Data[cOff : cOff+M*N], Stride: N},
+			c.Data[cOff:cOff+M*N], int32(N),
 		)
 	}
 
