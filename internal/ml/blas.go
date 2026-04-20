@@ -7,11 +7,13 @@ import (
 	"gonum.org/v1/gonum/blas/blas32"
 )
 
-// CBLAS order / transpose constants matching the C enum values used by cblas_sgemm.
+// CBLAS order / transpose constants matching the C enum values defined in
+// the CBLAS specification (cblas.h). These correspond to the CblasOrder and
+// CblasTranspose enumerations respectively.
 const (
-	cblasRowMajor int32 = 101
-	cblasNoTrans  int32 = 111
-	cblasTrans    int32 = 112
+	cblasRowMajor int32 = 101 // CblasRowMajor
+	cblasNoTrans  int32 = 111 // CblasNoTrans
+	cblasTrans    int32 = 112 // CblasTrans
 )
 
 // sgemmFunc is the Go-level signature for an SGEMM implementation.

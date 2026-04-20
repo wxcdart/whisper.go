@@ -26,13 +26,6 @@ func init() {
 			continue
 		}
 
-		// Verify that cblas_sgemm is actually exported by this library.
-		sym, err := purego.Dlsym(handle, "cblas_sgemm")
-		if err != nil || sym == 0 {
-			_ = purego.Dlclose(handle)
-			continue
-		}
-
 		var cblasSgemm func(
 			order, transA, transB int32,
 			M, N, K int32,
@@ -43,6 +36,10 @@ func init() {
 			C *float32, ldc int32,
 		)
 		purego.RegisterLibFunc(&cblasSgemm, handle, "cblas_sgemm")
+		if cblasSgemm == nil {
+			_ = purego.Dlclose(handle)
+			continue
+		}
 
 		sgemmImpl = func(
 			transA, transB int32,

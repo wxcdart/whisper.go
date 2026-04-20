@@ -6,7 +6,10 @@ import (
 	"github.com/ebitengine/purego"
 )
 
-// accelerateBLASPath is the Accelerate framework BLAS dylib on macOS.
+// accelerateBLASPath is the canonical Accelerate framework BLAS dylib on macOS.
+// Note: This path reflects the layout in macOS 10.x–14.x. If Apple changes the
+// framework structure in a future release, the init will fail silently and the
+// gonum fallback will remain active.
 const accelerateBLASPath = "/System/Library/Frameworks/Accelerate.framework/Versions/A/Libraries/libBLAS.dylib"
 
 func init() {
